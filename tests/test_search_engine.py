@@ -1,6 +1,8 @@
 import unittest
 
-from easysearch import ServiceSearchEngine
+import json
+
+from easysearch import DashScopeClient, ServiceSearchEngine
 
 
 SERVICES = [
@@ -74,6 +76,57 @@ class ServiceSearchEngineTests(unittest.TestCase):
         for idx in range(11):
             self.engine.search("u-h", f"查询{idx}")
         self.assertEqual(len(self.engine.user_query_history["u-h"]), 11)
+
+    def test_dashscope_payloads_are_used_when_api_key_exists(self) -> None:
+        calls: list[tuple[str, dict, dict]] = []
+
+        def requester(url: str, body: bytes, headers: dict[str, str]) -> dict:
+            payload = json.loads(body.decode("utf-8"))
+            calls.append((url, payload, headers))
+
+            if "text-embedding" in url:
+                return {"output": {"embeddings": [{"embedding": [1.0, 0.0, 0.0]}]}}
+            if "text-rerank" in url:
+                docs = payload["input"]["documents"]
+                return {
+                    "output": {
+                        "results": [
+                            {"index": index, "relevance_score": float(len(docs) - index)}
+                            for index in range(len(docs))
+                        ]
+                    }
+                }
+            if "chat/completions" in url:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    [
+                                        {"service_id": "svc-1", "reason": "与订单语义最相关"},
+                                        {"service_id": "svc-2", "reason": "与用户信息次相关"},
+                                    ],
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        client = DashScopeClient(api_key="placeholder-api-key", requester=requester)
+        engine = ServiceSearchEngine(dashscope_client=client)
+        engine.load_knowledge_base(SERVICES)
+        results = engine.search("u-api", "订单审批")
+
+        self.assertTrue(results)
+        self.assertTrue(any("text-embedding/text-embedding" in url for url, _, _ in calls))
+        self.assertTrue(any("rerank/text-rerank/text-rerank" in url for url, _, _ in calls))
+        self.assertTrue(any("compatible-mode/v1/chat/completions" in url for url, _, _ in calls))
+        embedding_call = next(payload for url, payload, _ in calls if "text-embedding/text-embedding" in url)
+        self.assertEqual(embedding_call["model"], "qwen3.7-text-embedding")
+        self.assertIn("texts", embedding_call["input"])
+        self.assertTrue(results[0]["rerank_reason"])
 
 
 if __name__ == "__main__":
