@@ -80,10 +80,16 @@ async function loadDropdown() {
       label: (item) => item.service_name,
       onClick: (item) => showService(item.service_id),
     });
+    // 猜你想用：协同过滤推荐，点击直接进入该服务详情
+    renderChips("recommended-services", data.recommended_services || [], {
+      label: (item) => item.service_name,
+      onClick: (item) => showService(item.service_id),
+    });
     $("dropdown").hidden = !(
       (data.recent_queries || []).length ||
       (data.recent_clicked_services || []).length ||
-      (data.global_hot_services || []).length
+      (data.global_hot_services || []).length ||
+      (data.recommended_services || []).length
     );
   } catch (err) {
     console.warn("dropdown failed", err);

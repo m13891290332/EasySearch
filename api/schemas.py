@@ -240,6 +240,7 @@ class DropdownResponse(BaseModel):
     recent_queries: list[str] = Field(default_factory=list)
     recent_clicked_services: list[DropdownItem] = Field(default_factory=list)
     global_hot_services: list[DropdownItem] = Field(default_factory=list)
+    recommended_services: list[DropdownItem] = Field(default_factory=list)
 
 
 class SuggestResponse(BaseModel):

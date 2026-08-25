@@ -22,6 +22,11 @@ _CONTROL_RE = re.compile(
     r"[\x00-\x1F\x7F\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060\uFEFF]"
 )
 
+# Markdown 标题标记：行首 1-6 个 # 后跟空白（H1-H6）
+_MARKDOWN_HEADER_LEADING_RE = re.compile(r'^#{1,6}\s+')
+# 行内 ##/### 标记：2+ 个 # 后跟空白（常见于未清洗的 service_intro 数据）
+_MARKDOWN_HEADER_INLINE_RE = re.compile(r'#{2,}\s*')
+
 # 提示词注入关键词（中英文，覆盖常见越狱话术）
 _INJECTION_PATTERNS = [
     "忽略上述", "忽略上面", "忽略之前", "忽略前面",
@@ -96,11 +101,26 @@ def is_prompt_injection(query: Any) -> bool:
 
 
 # ---------------------------------------------------------------- KB 字段
+def strip_markdown(text: str) -> str:
+    """剥除 markdown 标题标记（#、##、### 等），保留正文。
+
+    - 行首 1-6 个 # + 空白（H1-H6）→ 直接移除
+    - 行内 2+ 个 # + 可选空白（## 标题，常见于未清洗的 service_intro）→ 替换为空格
+    - 保留单词中间的单个 #（如 ``C#``、``#1``）
+    - 合并多余空格
+    """
+    text = _MARKDOWN_HEADER_LEADING_RE.sub("", text)
+    text = _MARKDOWN_HEADER_INLINE_RE.sub(" ", text)
+    text = re.sub(r" {2,}", " ", text).strip()
+    return text
+
+
 def sanitize_text(text: Any, max_len: int = MAX_TEXT_LEN) -> str:
-    """KB 字段清洗：剥控制/零宽字符，限长（默认 2000）。"""
+    """KB 字段清洗：剥控制/零宽字符 + markdown 标题标记，限长（默认 2000）。"""
     if not isinstance(text, str):
         text = str(text or "")
     cleaned = _CONTROL_RE.sub("", text)
+    cleaned = strip_markdown(cleaned)
     if len(cleaned) > max_len:
         cleaned = cleaned[:max_len]
     return cleaned

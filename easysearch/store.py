@@ -208,6 +208,28 @@ class SQLiteStore:
             ).fetchone()
         return int(row["n"]) if row else 0
 
+    def click_query_pairs(self, limit: int = 5000) -> list[tuple[str, str]]:
+        """DCN 训练正样本：把每次非下线点击关联到该用户点击前最近一次搜索 query。
+
+        返回 [(service_id, query)]，用于构造 (query, service_id, label=1) 训练对。
+        关联规则：取同 user_id 且 ts <= click.ts 中 id 最大的 query（即点击前最近搜索），
+        无前置 query 的点击跳过（无法归因）。limit 控制扫描规模，避免大库全表压力。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT uc.service_id AS sid, uq.query AS query "
+                "FROM user_clicks uc "
+                "JOIN user_queries uq ON uq.user_id = uc.user_id AND uq.ts <= uc.ts "
+                "WHERE uc.deprecated = 0 "
+                "  AND uq.id = ("
+                "    SELECT MAX(uq2.id) FROM user_queries uq2 "
+                "    WHERE uq2.user_id = uc.user_id AND uq2.ts <= uc.ts"
+                "  ) "
+                "ORDER BY uc.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [(row["sid"], row["query"]) for row in rows]
+
     # ---------- 点击历史 ----------
     def append_click(
         self, user_id: str, service_id: str, ts: float, deprecated: bool = False
@@ -282,6 +304,59 @@ class SQLiteStore:
                 "SELECT service_id, count FROM global_clicks"
             ).fetchall()
         return Counter({row["service_id"]: int(row["count"]) for row in rows})
+
+    # ---------- 协同过滤推荐（猜你想用）----------
+    def collaborative_filter(
+        self,
+        user_id: str,
+        exclude_ids: set[str] | None = None,
+        limit: int = 3,
+    ) -> list[str]:
+        """基于 item-based 协同过滤的「猜你想用」推荐。
+
+        思路：以目标用户已点击的服务为种子，找出同样点过这些服务的其他用户，
+        把他们点过、而目标用户未点过的服务按共现用户数（co-occurrence）排序推荐。
+
+        - exclude_ids：需排除的 service_id（最近点击 / 已在热门榜展示的，避免重复出现）
+        - 仅基于非下线点击（deprecated=0）建模，已下线服务不参与推荐
+        - 冷启动（用户无点击 / 无共现数据）返回空列表，由上层降级到内容/热度推荐
+        - 返回 service_id 列表（最近->最旧按 co_count 降序，同分按 service_id 字典序）
+        """
+        exclude_ids = exclude_ids or set()
+        with self._lock:
+            # 目标用户的非下线点击服务（种子）
+            seeds = {
+                row["service_id"]
+                for row in self._conn.execute(
+                    "SELECT DISTINCT service_id FROM user_clicks "
+                    "WHERE user_id=? AND deprecated=0",
+                    (user_id,),
+                ).fetchall()
+            }
+            if not seeds:
+                return []
+            # 种子已排除目标用户自身（uc1 涵盖所有点过种子的用户，含目标用户；
+            # 但 uc2.service_id != uc1.service_id 且目标用户已点过的服务仍在种子集，
+            # 需把种子也并入排除集，避免推荐用户已点过的服务）
+            exclude_set = seeds | exclude_ids
+            placeholders = ",".join("?" for _ in seeds)
+            excl_placeholders = ",".join("?" for _ in exclude_set)
+            rows = self._conn.execute(
+                "SELECT uc2.service_id AS candidate, "
+                "       COUNT(DISTINCT uc2.user_id) AS co_count "
+                "FROM user_clicks uc1 "
+                "JOIN user_clicks uc2 "
+                "  ON uc2.user_id = uc1.user_id "
+                "  AND uc2.service_id != uc1.service_id "
+                "  AND uc2.deprecated = 0 "
+                "WHERE uc1.service_id IN (" + placeholders + ") "
+                "  AND uc2.service_id NOT IN (" + excl_placeholders + ") "
+                "GROUP BY uc2.service_id "
+                "ORDER BY co_count DESC, candidate "
+                "LIMIT ?",
+                (*seeds, *exclude_set, limit),
+            ).fetchall()
+        return [row["candidate"] for row in rows]
 
     def popularity_decayed(
         self,

@@ -36,6 +36,7 @@ from .config import (
     VECTOR_WEIGHT,
 )
 from .dashscope import DashScopeClient
+from .dcn_reranker import DCNReranker
 from .deep_components import ComponentAnalyzer
 from .deepseek import DeepSeekClient
 from .din import DINHistoryOptimizer
@@ -110,7 +111,6 @@ class ServiceSearchEngine:
         self.embedding_model = Qwen37TextEmbedding(self.dashscope_client)
         self.history_optimizer = DINHistoryOptimizer()
         self.reasoner = DeepSeekReasoner(self.deepseek_client)
-        self.reranker = Qwen3VLReranker(self.dashscope_client, self.reasoner)
         self.bm25 = BM25Index()  # 兼容旧访问（单字段）
         self._mf_bm25 = MultiFieldBM25Index(field_weights=BM25_FIELD_WEIGHTS)  # A2 多字段
         self.store = store or SQLiteStore(db_path)
@@ -146,6 +146,22 @@ class ServiceSearchEngine:
         self._kb_versions_dir: str | None = (
             None if self._embeddings_dir is None
             else os.path.join(os.path.dirname(self._embeddings_dir), "kb_versions")
+        )
+        # DCN v2 保底重排器权重目录（与 embeddings/kb_versions 同级；:memory: 测试库不持久化）
+        self._dcn_model_dir: str | None = (
+            None if self._embeddings_dir is None
+            else os.path.join(os.path.dirname(self._embeddings_dir), "dcn_models")
+        )
+        # DCN v2 保底重排器：复用 embedding/vector_index/store，qwen-rerank 不可用时降级使用。
+        # 此处 store/vector_index/dirs 均已就绪；KB 加载后 rebuild_index + try_load 装载权重。
+        self._dcn_reranker = DCNReranker(
+            self.embedding_model,
+            self.vector_index,
+            self.store,
+            model_dir=self._dcn_model_dir,
+        )
+        self.reranker = Qwen3VLReranker(
+            self.dashscope_client, self.reasoner, self._dcn_reranker
         )
         # M9：当前 KB 内容 hash + 最近一次 embedding 错误（embedding-status 端点用）
         self.kb_hash: str = ""
@@ -366,6 +382,8 @@ class ServiceSearchEngine:
             self.synonym_expander = SynonymExpander()  # 重置为基础词典
             self.spell_corrector = None
             self._related_services.clear()  # 空库无相关服务，防旧数据残留
+            # 空库：清空 DCN 词表 + 丢弃旧模型（kb_hash 变更）
+            self._dcn_reranker.rebuild_index({}, "")
             return
 
         records: list[ServiceRecord] = []
@@ -447,6 +465,10 @@ class ServiceSearchEngine:
         self._service_embeddings_cache = {sid: self.vector_index.get(sid) for sid in self.services}
         # 搜索框路由占位：KB 加载后预计算每个服务 top-3 相关服务（cosine，排除自身）
         self._build_related_services()
+        # DCN v2 保底重排器：KB 加载后重建 service_id→idx 词表 + 尝试加载匹配 kb_hash 的权重。
+        # 权重未训练 / torch 不可用 → rerank 时走线性启发式（仍复用 embedding cosine）。
+        self._dcn_reranker.rebuild_index(self.services, self.kb_hash)
+        self._dcn_reranker.try_load()
 
     @staticmethod
     def _project_to_single_text(
@@ -1896,11 +1918,12 @@ class ServiceSearchEngine:
 
     # ---------- 首页下拉 ----------
     def homepage_dropdown(self, user_id: str) -> dict[str, list[Any]]:
-        """下拉默认项：最近3未重复搜索词 / 最近3未重复点击服务 / 全局最热3服务。
+        """下拉默认项：最近3未重复搜索词 / 最近3未重复点击服务 / 全局最热3服务 / 猜你想用3服务。
 
-        recent_queries 为字符串列表；点击/热门返回 [{service_id, service_name}]，
+        recent_queries 为字符串列表；点击/热门/推荐返回 [{service_id, service_name}]，
         前端据此可直接调 /api/service 进入该服务详情，无需重新搜索。
         注：hot_services 仍用 raw count（A4 的 popularity_decayed 仅用于搜索混合打分）。
+        猜你想用：协同过滤推荐，排除最近点击 + 热门已展示项，保证四列内容不重复。
         """
         recent_queries = self.store.recent_queries(user_id, 3)  # 最近->最旧
         recent_click_ids = self.store.recent_clicks(user_id, 3)  # 最近->最旧
@@ -1915,11 +1938,71 @@ class ServiceSearchEngine:
             for sid in hot_ids
             if sid in self.services
         ]
+        # 猜你想用：排除最近点击 + 热门已展示，避免四列重复
+        shown_ids = set(recent_click_ids) | set(hot_ids)
+        recommended = self.guess_you_like(
+            user_id, exclude_ids=shown_ids, limit=3
+        )
         return {
             "recent_queries": recent_queries,
             "recent_clicked_services": recent_clicked_services,
             "global_hot_services": hot_services,
+            "recommended_services": recommended,
         }
+
+    def guess_you_like(
+        self,
+        user_id: str,
+        exclude_ids: set[str] | None = None,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """「猜你想用」推荐：item-based 协同过滤，冷启动降级到内容/热度。
+
+        三级降级链（每级补充至 limit 条）：
+          1. 协同过滤：store.collaborative_filter，基于共现点击推荐未点过的服务
+          2. 内容相关：取用户最近点击服务的 embedding 相关服务（_related_services）
+          3. 全局热门：store.hot_services 兜底（新用户/无点击数据）
+
+        所有候选过滤 exclude_ids + 不在 KB 的悬挂引用，返回 [{service_id, service_name}]。
+        """
+        exclude_ids = set(exclude_ids or ())
+        result_ids: list[str] = []
+
+        def _collect(ids: list[str]) -> None:
+            for sid in ids:
+                if len(result_ids) >= limit:
+                    break
+                if sid in exclude_ids or sid in result_ids:
+                    continue
+                if sid not in self.services:
+                    continue
+                result_ids.append(sid)
+
+        # 1. 协同过滤
+        cf_ids = self.store.collaborative_filter(
+            user_id, exclude_ids=exclude_ids | set(result_ids), limit=limit
+        )
+        _collect(cf_ids)
+
+        # 2. 内容相关：基于最近点击服务的预计算相关服务
+        if len(result_ids) < limit:
+            recent_click_ids = self.store.recent_clicks(user_id, 3)
+            for seed_sid in recent_click_ids:
+                if len(result_ids) >= limit:
+                    break
+                related = self._related_services.get(seed_sid, [])
+                _collect(related)
+
+        # 3. 全局热门兜底
+        if len(result_ids) < limit:
+            # 多取一些热门服务补齐，排除已选
+            hot_ids = self.store.hot_services(limit * 4)
+            _collect(hot_ids)
+
+        return [
+            {"service_id": sid, "service_name": self.services[sid].service_name}
+            for sid in result_ids
+        ]
 
     # ---------- 单服务详情（不经过检索流程）----------
     def get_service(self, service_id: str) -> dict[str, Any] | None:
@@ -1960,12 +2043,22 @@ class ServiceSearchEngine:
                     with open(path, "r", encoding="utf-8") as fp:
                         loaded = json.load(fp)
                     if isinstance(loaded, dict):
-                        self._related_services = {
+                        candidate = {
                             str(k): [str(x) for x in v]
                             for k, v in loaded.items()
                             if isinstance(v, list)
                         }
-                        return
+                        # 校验缓存的 service_id 与当前 KB 一致；
+                        # 不一致则丢弃缓存重算（KB 缩容/换库后旧 ID 失效）
+                        if set(candidate.keys()) <= set(self.services):
+                            # 进一步校验每个候选列表中的 ID 仍在 KB 内
+                            all_valid = all(
+                                all(rid in self.services for rid in v)
+                                for v in candidate.values()
+                            )
+                            if all_valid:
+                                self._related_services = candidate
+                                return
                 except (OSError, json.JSONDecodeError):
                     pass  # 损坏则重算
         # 在线计算：服务数不多（KB 规模 ~50），N×N cosine 在毫秒级
@@ -2004,18 +2097,7 @@ class ServiceSearchEngine:
         ids = self._related_services.get(service_id)
         if not ids:
             # 即时算兜底（极端情况：_build_related_services 未跑或被清空）
-            vec = self.vector_index.get(service_id)
-            if not vec:
-                return []
-            sims = self.vector_index.score_all(vec)
-            ids = [
-                other
-                for other, _ in sorted(
-                    ((o, s) for o, s in sims.items() if o != service_id),
-                    key=lambda kv: kv[1],
-                    reverse=True,
-                )[:k]
-            ]
+            ids = self._compute_related_ids(service_id, k)
         result: list[dict[str, Any]] = []
         for rid in ids:
             if rid == service_id or rid not in self.services:
@@ -2025,7 +2107,49 @@ class ServiceSearchEngine:
                 result.append(detail)
             if len(result) >= k:
                 break
+        # 预计算 ID 全部失效（KB 缩容后旧 ID 被过滤殆尽）→ 即时算兜底
+        if not result:
+            fresh_ids = self._compute_related_ids(service_id, k)
+            for rid in fresh_ids:
+                if rid == service_id or rid not in self.services:
+                    continue
+                detail = self.get_service(rid)
+                if detail:
+                    result.append(detail)
+                if len(result) >= k:
+                    break
         return result
+
+    def _compute_related_ids(self, service_id: str, k: int) -> list[str]:
+        """即时用 cosine 相似度算 top-k 相关服务 ID（fallback 用）。"""
+        vec = self.vector_index.get(service_id)
+        if not vec:
+            return []
+        sims = self.vector_index.score_all(vec)
+        return [
+            other
+            for other, _ in sorted(
+                ((o, s) for o, s in sims.items() if o != service_id),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:k]
+        ]
+
+    # ---------- DCN v2 保底重排器训练 ----------
+    def train_dcn_reranker(self) -> dict[str, Any]:
+        """用 store 中的点击/搜索日志训练 DCN v2 保底重排器并落盘。
+
+        复用既有 embedding（query/候选向量）+ 召回侧信号构造特征，正样本来自
+        ``store.click_query_pairs``（点击→点击前最近 query），负样本随机采样。
+        torch 不可用 / 样本不足 / 词表未建 → 返回 {trained: False, reason: ...}，
+        不抛异常，rerank 继续走线性启发式保底。
+        """
+        return self._dcn_reranker.train_from_store(self.services)
+
+    @property
+    def dcn_reranker_available(self) -> bool:
+        """DCN v2 深度模型是否已加载可用（未训练则 rerank 走线性启发式）。"""
+        return self._dcn_reranker.available
 
     # ---------- M13 拼写建议 ----------
     def spell_suggest(self, query: str) -> str | None:

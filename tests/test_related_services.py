@@ -203,5 +203,101 @@ class FallbackTests(unittest.TestCase):
         self.assertLessEqual(len(self.engine.get_related_services("svc-1", k=1)), 1)
 
 
+class StaleCacheValidationTests(unittest.TestCase):
+    """缓存中的 service_id 与当前 KB 不一致时，应丢弃缓存并重算。"""
+
+    def setUp(self):
+        self.engine = _make_engine()
+
+    def tearDown(self):
+        self.engine.store.close()
+
+    def test_stale_cache_ids_recomputed(self):
+        """缓存含已不存在的 service_id → 丢弃缓存重算，结果 ID 均在 KB 内。"""
+        # 篡改内存缓存：注入一个不在 KB 中的悬挂 ID
+        self.engine._related_services["svc-1"] = ["ghost-1", "ghost-2", "ghost-3"]
+        items = self.engine.get_related_services("svc-1")
+        # 全部 ghost 被过滤 → fallback 即时算 → 返回有效结果
+        self.assertTrue(items, "悬挂 ID 全过滤后应 fallback 即时算")
+        for it in items:
+            self.assertIn(it["service_id"], VALID_IDS)
+
+    def test_stale_json_cache_invalidated_on_load(self):
+        """磁盘 JSON 缓存含不在 KB 的 ID → 加载时校验失败 → 重算。"""
+        import json
+
+        kb_hash = self.engine.kb_hash
+        path = os.path.join(
+            self.engine._related_dir, f"related_{kb_hash}.json"
+        )
+        self.assertTrue(os.path.exists(path))
+        # 写入含悬挂 ID 的缓存
+        stale = {"svc-1": ["ghost-x", "svc-2"], "svc-2": ["svc-1"], "svc-3": ["svc-1"]}
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump(stale, fp, ensure_ascii=False)
+        # 重新加载：ghost-x 不在 KB → 缓存校验失败 → 重算
+        engine2 = _make_engine(db_path=self.engine.store.db_path)
+        try:
+            # 重算结果中不应出现 ghost-x
+            for related in engine2._related_services.values():
+                self.assertNotIn("ghost-x", related)
+            # 结果应非空（3 服务 KB）
+            self.assertTrue(engine2._related_services)
+        finally:
+            engine2.store.close()
+
+    def test_partial_stale_ids_fallback(self):
+        """预计算列表中部分 ID 失效 → 过滤后仍能返回有效结果。"""
+        # svc-2/svc-3 仍在 KB，ghost 不在
+        self.engine._related_services["svc-1"] = ["ghost", "svc-2", "svc-3"]
+        items = self.engine.get_related_services("svc-1")
+        # ghost 被过滤，svc-2/svc-3 有效 → 结果非空
+        self.assertTrue(items)
+        ids = {it["service_id"] for it in items}
+        self.assertNotIn("ghost", ids)
+        self.assertTrue(ids & {"svc-2", "svc-3"})
+
+
+class MarkdownCleanOnKBLoadTests(unittest.TestCase):
+    """KB 导入时 service_intro 中的 ## 标题标记应被 sanitize_text 剥除。"""
+
+    def test_markdown_headers_stripped_on_load(self):
+        """含 ## 标题的 service_intro 导入后被清洗，不含 # 标记。"""
+        services_with_markdown = [
+            {
+                "service_id": "svc-md-1",
+                "service_name": "行内转账",
+                "aliases": ["内部转账", "同行转账"],
+                "service_intro": (
+                    "# 行内转账## 一、功能描述支持行内、跨行、跨境等多种转账方式，"
+                    "提供实时到账与预约转账功能，确保资金流转高效安全。"
+                    "## 二、使用方法1. 选择转账方式；2. 输入收款方信息；"
+                    "3. 填写转账金额；4. 验证身份并提交；5. 查看转账结果。"
+                ),
+                "route": "/transfer/inline",
+            },
+            {
+                "service_id": "svc-md-2",
+                "service_name": "跨行转账",
+                "aliases": ["跨行"],
+                "service_intro": "### 三级标题内容### 另一个标题",
+                "route": "/transfer/cross",
+            },
+        ]
+        engine = _make_engine(services=services_with_markdown)
+        try:
+            for sid in ("svc-md-1", "svc-md-2"):
+                svc = engine.services[sid]
+                self.assertNotIn("#", svc.service_intro, (
+                    f"{sid} 的 service_intro 仍含 # 标记：{svc.service_intro}"
+                ))
+                self.assertNotIn("##", svc.service_intro)
+            # 相关服务仍正常计算（markdown 清洗不影响 embedding 流程）
+            related = engine.get_related_services("svc-md-1")
+            self.assertLessEqual(len(related), 1)  # 仅 2 服务，排除自身后 ≤1
+        finally:
+            engine.store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -520,6 +520,9 @@ def create_app() -> FastAPI:
             global_hot_services=[
                 DropdownItem(**item) for item in data["global_hot_services"]
             ],
+            recommended_services=[
+                DropdownItem(**item) for item in data["recommended_services"]
+            ],
         )
 
     @app.get("/api/search/suggest", response_model=SuggestResponse, tags=["search"])

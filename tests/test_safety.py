@@ -89,6 +89,34 @@ class SanitizeTextTests(unittest.TestCase):
     def test_non_string_coerced(self):
         self.assertEqual(sanitize_text(12345), "12345")
 
+    def test_strips_leading_markdown_header(self):
+        self.assertEqual(sanitize_text("# 行内转账功能"), "行内转账功能")
+
+    def test_strips_inline_markdown_headers(self):
+        """service_intro 中的 ## 标题标记应被剥除。"""
+        raw = "# 行内转账## 一、功能描述支持行内转账## 二、使用方法选择转账方式"
+        cleaned = sanitize_text(raw)
+        self.assertNotIn("#", cleaned)
+        self.assertIn("行内转账", cleaned)
+        self.assertIn("功能描述", cleaned)
+        self.assertIn("使用方法", cleaned)
+
+    def test_preserves_single_hash_midword(self):
+        """单词中间的单个 #（如 C#）应保留。"""
+        self.assertEqual(sanitize_text("C# 编程服务"), "C# 编程服务")
+        self.assertIn("#", sanitize_text("问题 #1 编号"))
+
+    def test_collapses_extra_spaces(self):
+        """剥除 ## 后合并多余空格。"""
+        raw = "转账 ## 一、功能 安全"
+        cleaned = sanitize_text(raw)
+        self.assertNotIn("  ", cleaned)
+
+    def test_strips_triple_hash(self):
+        """### 三级标题也应剥除。"""
+        cleaned = sanitize_text("### 三、使用方法")
+        self.assertEqual(cleaned, "三、使用方法")
+
 
 class StripHtmlTests(unittest.TestCase):
     def test_strips_script_tags(self):

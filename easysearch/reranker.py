@@ -218,18 +218,44 @@ class Qwen3VLReranker:
     model_name = "qwen3-vl-rerank"
     endpoint = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
 
-    def __init__(self, dashscope_client: DashScopeClient, reasoner: DeepSeekReasoner) -> None:
+    def __init__(
+        self,
+        dashscope_client: DashScopeClient,
+        reasoner: DeepSeekReasoner,
+        dcn_reranker: Any | None = None,
+    ) -> None:
         self.client = dashscope_client
         self.reasoner = reasoner
+        # DCN v2 保底重排器：qwen-rerank 不可用 / 失败时的降级路径（优于 token-overlap）
+        self.dcn_reranker = dcn_reranker
+
+    # ---------- DCN v2 保底重排 ----------
+    def _dcn_rerank(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """DCN v2 保底重排：优先走 DCN（深度模型/线性启发式），失败回退 token-overlap。
+
+        不附 ``rerank_reason``（由 ``rerank``/``rerank_async`` 调用方统一填充模板理由），
+        与 ``_map_rerank_response`` 语义一致；DCN 仅设置 ``rerank_score``/``dcn_score``。
+        """
+        if self.dcn_reranker is not None:
+            try:
+                return self.dcn_reranker.rerank(query, candidates)
+            except Exception:  # noqa: BLE001 - DCN 异常不阻断，降级到 token-overlap
+                logger.warning(
+                    "DCN rerank failed, fallback to local token-overlap",
+                    exc_info=True,
+                )
+        return self._local_rerank(query, candidates)
 
     # ---------- 同步入口（兼容旧链路 / 测试） ----------
     def rerank(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not candidates:
             return []
+        # 有 Key 走 qwen-rerank 远程（远程失败在 _remote_rerank 内部降级到 _dcn_rerank）；
+        # 无 Key 直接走 DCN v2 保底（优于纯 token-overlap）
         reranked = (
             self._remote_rerank(query, candidates)
             if self.client.enabled
-            else self._local_rerank(query, candidates)
+            else self._dcn_rerank(query, candidates)
         )
         reasons = self.reasoner.generate_reasons(query, reranked)
         for item in reranked:
@@ -247,7 +273,8 @@ class Qwen3VLReranker:
         if self.client.enabled:
             reranked = await self._remote_rerank_async(query, candidates)
         else:
-            reranked = self._local_rerank(query, candidates)
+            # 无 Key 直接走 DCN v2 保底（优于纯 token-overlap）
+            reranked = self._dcn_rerank(query, candidates)
         # 仅附模板 reason；LLM reason 由 engine.search_async gather 后覆盖
         for item in reranked:
             if not item.get("rerank_reason"):
@@ -300,7 +327,8 @@ class Qwen3VLReranker:
             response = self.client.post_json(self.endpoint, payload)
             return self._map_rerank_response(response, query, candidates)
         except RuntimeError:
-            return self._local_rerank(query, candidates)
+            # 远程失败：DCN v2 保底（DCN 不可用则在 _dcn_rerank 内回退 token-overlap）
+            return self._dcn_rerank(query, candidates)
 
     async def _remote_rerank_async(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         docs = [self._candidate_text(item) for item in candidates]
@@ -313,15 +341,16 @@ class Qwen3VLReranker:
             response = await self.client.post_json_async(self.endpoint, payload)
             return self._map_rerank_response(response, query, candidates)
         except RuntimeError:
-            return self._local_rerank(query, candidates)
+            # 远程失败：DCN v2 保底（DCN 不可用则在 _dcn_rerank 内回退 token-overlap）
+            return self._dcn_rerank(query, candidates)
 
     def _map_rerank_response(
         self, response: dict[str, Any], query: str, candidates: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """把 rerank 接口响应映射为按 rerank_score 降序的候选列表；空则回退本地。"""
+        """把 rerank 接口响应映射为按 rerank_score 降序的候选列表；空则回退 DCN 保底。"""
         rows = response.get("output", {}).get("results", [])
         if not isinstance(rows, list) or not rows:
-            return self._local_rerank(query, candidates)
+            return self._dcn_rerank(query, candidates)
         mapped: list[dict[str, Any]] = []
         for row in rows:
             index = row.get("index")
@@ -334,7 +363,7 @@ class Qwen3VLReranker:
             )
             mapped.append(item)
         if not mapped:
-            return self._local_rerank(query, candidates)
+            return self._dcn_rerank(query, candidates)
         mapped.sort(key=lambda x: x["rerank_score"], reverse=True)
         return mapped
 
