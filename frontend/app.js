@@ -460,25 +460,28 @@ function renderResults(results, isDirect, currentQuery) {
       : `<div class="reason">💡 ${escapeHtml(item.rerank_reason || "")}</div>`;
     const q = isDirect ? "" : (currentQuery || "");
     card.innerHTML = `
-      <div class="card-head">
-        ${headExtra}
-        <h2 class="svc-name">${highlight(item.service_name, q)}</h2>
+      <div class="card-main">
+        <div class="card-head">
+          ${headExtra}
+          <h2 class="svc-name">${highlight(item.service_name, q)}</h2>
+        </div>
+        <div class="aliases">${(item.aliases || []).map((a) => highlight(a, q)).join(" · ")}</div>
+        <p class="intro">${highlight(truncate(item.service_intro, 200), q)}</p>
+        <div class="actions">
+          ${
+            isSafeRoute(item.route)
+              ? `<a class="btn btn-route" href="${escapeAttr(item.route)}" target="_blank" rel="noopener noreferrer">
+                   ${escapeHtml(item.decision_button || "进入")} →
+                 </a>`
+              : `<span class="btn btn-route btn-disabled" title="该路由被安全策略拦截">🚫 进入 →</span>`
+          }
+          <span class="badge">组件：${escapeHtml(item.component || "-")}</span>
+          <span class="badge">路由：${escapeHtml(item.route || "-")}</span>
+        </div>
+        ${renderComponentActions(item)}
+        ${reason}
       </div>
-      <div class="aliases">${(item.aliases || []).map((a) => highlight(a, q)).join(" · ")}</div>
-      <p class="intro">${highlight(truncate(item.service_intro, 200), q)}</p>
-      <div class="actions">
-        ${
-          isSafeRoute(item.route)
-            ? `<a class="btn btn-route" href="${escapeAttr(item.route)}" target="_blank" rel="noopener noreferrer">
-                 ${escapeHtml(item.decision_button || "进入")} →
-               </a>`
-            : `<span class="btn btn-route btn-disabled" title="该路由被安全策略拦截">🚫 进入 →</span>`
-        }
-        <span class="badge">组件：${escapeHtml(item.component || "-")}</span>
-        <span class="badge">路由：${escapeHtml(item.route || "-")}</span>
-      </div>
-      ${renderComponentActions(item)}
-      ${reason}
+      <aside class="card-deep" data-sid="${escapeAttr(item.service_id)}"></aside>
     `;
     // 点击记录（仅搜索结果记录点击行为；直接访问也可记录以更新热门）
     const routeBtn = card.querySelector(".btn-route");
@@ -488,6 +491,68 @@ function renderResults(results, isDirect, currentQuery) {
     bindComponentActions(card, item);
     box.appendChild(card);
   });
+  // 深度检索：勾选后异步填充每条结果右侧的「最佳组件」chip
+  doDeepComponents(results.slice(0, 10));
+}
+
+// 深度组件检索：对 top-10 结果调 /api/search/deep-components，把最契合 query
+// 的组件 chip 渲染到对应 .card-deep（按 data-sid 匹配，避免 CSS 选择器转义问题）。
+// chip 点击：有 component+action → 执行组件动作；仅有 href → 安全跳转。
+async function doDeepComponents(results) {
+  const deepToggle = $("deep-toggle");
+  if (!deepToggle || !deepToggle.checked || !results || !results.length) return;
+  const serviceIds = results.map((r) => r.service_id).filter(Boolean);
+  if (!serviceIds.length) return;
+  const query = ($("query") && $("query").value) || "";
+  try {
+    const data = await postJson(`${API}/search/deep-components`, {
+      user_id: userId,
+      query,
+      service_ids: serviceIds,
+    });
+    const items = (data && data.items) || [];
+    document.querySelectorAll(".card-deep").forEach((aside) => {
+      const sid = aside.dataset.sid;
+      if (!sid) return;
+      const item = items.find((it) => it.service_id === sid);
+      if (!item) return;
+      const chip = document.createElement("div");
+      chip.className = "deep-chip";
+      chip.title = item.reason || "";
+      chip.innerHTML =
+        `<span class="deep-label">${escapeHtml(item.label || "")}</span>` +
+        `<span class="badge badge-sub">${escapeHtml(item.source || "")}</span>`;
+      chip.addEventListener("click", () => {
+        if (item.component && item.action) {
+          // 复用 M8 组件动作执行链路（/api/action/execute 打桩）
+          executeDeepComponent(item.service_id, item.component, item.action, aside);
+        } else if (item.href && isSafeRoute(item.href)) {
+          window.open(item.href, "_blank", "noopener,noreferrer");
+        }
+      });
+      aside.appendChild(chip);
+    });
+  } catch (err) {
+    console.error("Deep components failed", err);
+  }
+}
+
+// 深度组件 chip 的点击执行：在 chip 下方就地展示执行结果（复用 M8 渲染逻辑）
+async function executeDeepComponent(serviceId, component, action, aside) {
+  if (!serviceId || !component || !action) return;
+  let result = aside.querySelector(".deep-result");
+  if (!result) {
+    result = document.createElement("div");
+    result.className = "deep-result";
+    aside.appendChild(result);
+  }
+  result.innerHTML = '<span class="comp-pending">执行中…</span>';
+  try {
+    const resp = await executeAction(serviceId, component, action);
+    result.innerHTML = renderActionResult(resp, component, action);
+  } catch (err) {
+    result.innerHTML = `<span class="comp-error">动作失败：${escapeHtml(err.message)}</span>`;
+  }
 }
 
 // M8 渲染页面内组件动作按钮区：每个 component 一颗按钮

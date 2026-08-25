@@ -165,6 +165,37 @@ class IntersectionSearchRequest(BaseModel):
     original_query: str | None = None
 
 
+class DeepComponentRequest(BaseModel):
+    """深度组件检索请求：对 top-10 结果分别抓取服务 route 页面并分析最佳组件。
+
+    前端勾选「深度检索」后，搜索完成自动调用。``service_ids`` 由搜索结果
+    前 10 条派生；后端复用 ``engine.analyze_deep_components_async`` 并发分析。
+    """
+
+    user_id: str
+    query: str
+    service_ids: list[str]
+
+
+class DeepComponentItem(BaseModel):
+    """单服务的深度组件推荐项（渲染到搜索结果右侧的可点击 chip）。"""
+
+    service_id: str
+    label: str
+    reason: str = ""
+    component: str = ""
+    action: str = ""
+    href: str = ""
+    route: str = ""
+    source: str = ""  # "llm" | "heuristic"
+
+
+class DeepComponentResponse(BaseModel):
+    """深度组件检索响应：按请求的 service_ids 顺序返回推荐项（异常项被跳过）。"""
+
+    items: list[DeepComponentItem]
+
+
 class DropdownItem(BaseModel):
     service_id: str
     service_name: str

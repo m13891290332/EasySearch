@@ -36,6 +36,7 @@ from .config import (
     VECTOR_WEIGHT,
 )
 from .dashscope import DashScopeClient
+from .deep_components import ComponentAnalyzer
 from .deepseek import DeepSeekClient
 from .din import DINHistoryOptimizer
 from .embedding import Qwen37TextEmbedding
@@ -52,7 +53,14 @@ from .metrics import get_metrics
 from .mmr import MMRReranker
 from .models import ServiceRecord, route_info
 from .reranker import Qwen3VLReranker, DeepSeekReasoner
-from .safety import PromptInjectionError, sanitize_query, sanitize_text, safe_route
+from .safety import (
+    PromptInjectionError,
+    safe_route,
+    sanitize_query,
+    sanitize_text,
+    validate_route_url,
+)
+from .page_fetcher import fetch_page_async
 from .spell import LevenshteinCorrector
 from .store import SQLiteStore
 from .suggest import QuerySuggester
@@ -109,6 +117,9 @@ class ServiceSearchEngine:
         self.guide_generator = GuideGenerator(self.deepseek_client)
         # 搜索框灰色补全建议器（复用 DeepSeek 客户端；无 key/前缀不匹配 → 返 None 隐藏灰色）
         self.query_suggester = QuerySuggester(self.deepseek_client)
+        # 深度组件检索：top-10 结果抓取服务 route 页面 → LLM 分析「最契合 query 的组件」
+        # 无 key / LLM 失败 → ComponentAnalyzer 内部降级启发式（pick_heuristic）
+        self.component_analyzer = ComponentAnalyzer(self.deepseek_client)
 
         # A 组 / B 组新组件
         self.vector_index = VectorIndex()
@@ -976,6 +987,74 @@ class ServiceSearchEngine:
             cache_hit=False, degraded=False, sub_queries=queries,
         )
         return (final, match_mode)
+
+    # ---------- 深度组件检索 ----------
+    async def analyze_deep_components_async(
+        self,
+        user_id: str,
+        query: str,
+        service_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """对 top-10 搜索结果并发分析「最契合 query 的组件」。
+
+        前端勾选「深度检索」后，搜索完成自动调用（经
+        ``POST /api/search/deep-components``）。每条结果右侧渲染一个可点击
+        的组件 chip，用户可直接执行组件动作或跳转 route。
+
+        流程（每服务并发，单服务内串行 fetch→analyze）：
+            1. service_ids 截断为前 10
+            2. route 为 http(s) → ``fetch_page_async`` 抓页面文本；
+               抓取失败 / route 为相对路径 → 用 ``service_intro`` 兜底
+            3. ``component_analyzer.analyze_async`` 调 LLM 分析（无 key / 失败
+               → 内部启发式降级）
+            4. 单服务异常 → 跳过该项（不返回，保证 items 全部可用）
+
+        返回 list[dict]，每项形态：
+            {service_id, label, reason, component, action, href, route, source}
+        其中 source ∈ {"llm", "heuristic"}。query 命中注入关键词 → 抛
+        PromptInjectionError（API 层捕获返 400）。
+        """
+        q = sanitize_query(query)  # 复用查询清洗（注入命中 → PromptInjectionError）
+        ids = list(service_ids)[:10]
+        services = [self.services[sid] for sid in ids if sid in self.services]
+        if not services:
+            return []
+        tasks = [self._analyze_one_component_async(q, service) for service in services]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        items: list[dict[str, Any]] = []
+        for service, res in zip(services, results):
+            if isinstance(res, Exception):
+                logger.warning(
+                    "deep component analyze failed for %s: %s",
+                    service.service_id,
+                    res,
+                )
+                continue
+            if isinstance(res, dict):
+                items.append({**res, "service_id": service.service_id})
+        return items
+
+    async def _analyze_one_component_async(
+        self, query: str, service: ServiceRecord
+    ) -> dict[str, Any]:
+        """单服务：抓 route 页面文本（仅 http(s)）→ 分析组件。"""
+        info = route_info(service.route)
+        route_url = info["route"]
+        page_text = ""
+        if (
+            route_url
+            and validate_route_url(route_url)
+            and route_url.lower().startswith(("http://", "https://"))
+        ):
+            try:
+                page_text = await fetch_page_async(route_url)
+            except Exception as exc:
+                logger.debug("page fetch failed for %s: %s", route_url, exc)
+                page_text = ""
+        if not page_text:
+            # 抓取失败 / route 为相对路径 / 非文本 → 用简介兜底
+            page_text = service.service_intro
+        return await self.component_analyzer.analyze_async(query, service, page_text)
 
     # ---------- M7 长程对话 ----------
     def _session_exists(self, session_id: str) -> bool:

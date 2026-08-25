@@ -25,6 +25,9 @@ from .schemas import (
     AnswerGuide,
     ClickRequest,
     DegradationStats,
+    DeepComponentItem,
+    DeepComponentRequest,
+    DeepComponentResponse,
     DropdownItem,
     DropdownResponse,
     EmbeddingStatusResponse,
@@ -396,6 +399,39 @@ def create_app() -> FastAPI:
             results=[SearchResultItem(**item) for item in results],
             spell_suggestion=spell_suggestion,
             timing=timing,
+        )
+
+    @app.post(
+        "/api/search/deep-components",
+        response_model=DeepComponentResponse,
+        tags=["search"],
+    )
+    async def deep_components(
+        payload: DeepComponentRequest,
+    ) -> DeepComponentResponse:
+        """深度组件检索端点。
+
+        前端勾选「深度检索」后，搜索完成自动调用：对 top-10 结果分别抓取
+        服务 route 页面（仅 http(s)，SSRF 防御在 ``page_fetcher`` 内），
+        调 LLM 分析「最契合 query 的组件」，渲染到每条结果右侧的可点击 chip。
+        无 Key / LLM 失败 / 抓取失败 → 启发式降级（``pick_heuristic``）。
+        """
+        engine = get_engine()
+        if not engine.services:
+            raise HTTPException(status_code=409, detail="知识库为空，请先上传")
+        if not payload.service_ids:
+            raise HTTPException(status_code=400, detail="service_ids 不能为空")
+        try:
+            items = await engine.analyze_deep_components_async(
+                user_id=payload.user_id,
+                query=payload.query,
+                service_ids=payload.service_ids,
+            )
+        except PromptInjectionError as exc:
+            # M1：提示词注入命中 → 400，不穿透 500、不泄露后端细节
+            raise HTTPException(status_code=400, detail=str(exc))
+        return DeepComponentResponse(
+            items=[DeepComponentItem(**item) for item in items]
         )
 
     @app.get("/api/dropdown", response_model=DropdownResponse, tags=["search"])

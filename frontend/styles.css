@@ -375,7 +375,49 @@ body {
   flex-direction: column;
   gap: 12px;
 }
-.card { padding: 16px 18px; }
+.card {
+  padding: 16px 18px;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.card-main {
+  flex: 1;
+  min-width: 0;
+}
+/* 深度组件检索：结果右侧可点击的「最佳组件」chip 区 */
+.card-deep {
+  width: 220px;
+  flex-shrink: 0;
+  border-left: 1px dashed var(--border-solid);
+  padding-left: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.card-deep:empty { display: none; }
+.deep-chip {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.deep-chip:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.deep-label { font-weight: 600; }
+.deep-result {
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-word;
+}
 .card-head {
   display: flex;
   align-items: baseline;
@@ -691,6 +733,22 @@ mark {
   background: var(--primary);
   color: #fff;
 }
+/* 深度检索开关：与高级搜索/会话按钮并列 */
+.deep-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 42px;
+  padding: 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  cursor: pointer;
+  user-select: none;
+}
+.deep-toggle input { width: 15px; height: 15px; cursor: pointer; }
 .advanced-panel {
   margin-top: 14px;
   padding: 16px;
