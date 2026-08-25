@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EasySearch 服务搜索</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="brand">
+      <h1>EasySearch</h1>
+      <p class="tagline">平台内服务搜索引擎 · 向量 + BM25 混合检索 · qwen3-vl-rerank 重排</p>
+      <p class="nav-links"><a href="/kb">知识库管理</a></p>
+    </header>
+
+    <section class="search-box">
+      <div class="query-wrap">
+        <span id="suggest-ghost" class="suggest-ghost" aria-hidden="true"></span>
+        <input
+          id="query"
+          type="text"
+          autocomplete="off"
+          placeholder="搜索服务，如：开户、银证转账、新股新债…"
+        />
+      </div>
+      <button id="search-btn" type="button">搜索</button>
+      <select id="retrieval-mode" class="retrieval-mode-select" title="检索模式：keyword=仅关键词 / semantic=仅语义 / hybrid=混合">
+        <option value="hybrid" selected>混合检索</option>
+        <option value="keyword">仅关键词</option>
+        <option value="semantic">仅语义</option>
+      </select>
+      <button id="session-toggle" type="button" class="btn-session" title="开启多轮对话：首轮宽召回，后续轮基于上下文精化，可撤回">
+        会话模式：关
+      </button>
+    </section>
+
+    <section id="session-panel" class="session-panel" hidden>
+      <div class="session-head">
+        <h3>对话轮次</h3>
+        <button id="rollback-btn" type="button" class="btn-rollback" disabled>↩ 撤回上一轮</button>
+      </div>
+      <ul id="session-turns" class="chip-list session-turns"></ul>
+    </section>
+
+    <section id="dropdown" class="dropdown" hidden>
+      <div class="dropdown-col">
+        <h3>最近搜索</h3>
+        <ul id="recent-queries" class="chip-list"></ul>
+      </div>
+      <div class="dropdown-col">
+        <h3>最近点击</h3>
+        <ul id="recent-clicks" class="chip-list"></ul>
+      </div>
+      <div class="dropdown-col">
+        <h3>热门服务</h3>
+        <ul id="hot-services" class="chip-list"></ul>
+      </div>
+    </section>
+
+    <div id="spell-suggestion" class="spell-suggestion" hidden></div>
+
+    <section id="results" class="results"></section>
+
+    <footer class="footer">
+      <span id="status">就绪</span>
+      <span id="engine-info"></span>
+    </footer>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

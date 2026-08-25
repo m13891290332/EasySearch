@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 本地数据库
+data/
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# 安全：config.py 现已零密钥（M1 改为从环境变量/.env 读取），可安全提交
+# 密钥请写入 .env（见 .env.example），.env 不提交
+
+# 环境变量
+.env

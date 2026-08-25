@@ -1,0 +1,28 @@
+# EasySearch 依赖
+# 后端框架
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# 安全：M1 从 .env 加载密钥（软依赖，未安装则回退纯环境变量）
+python-dotenv==1.0.1
+
+# 中文分词（BM25 召回质量依赖）
+jieba==0.42.1
+
+# 向量检索（B2：FAISS IndexFlatIP 批量 cosine；无 faiss 时 VectorIndex 自动降级 Python 循环）
+faiss-cpu==1.8.0
+
+# 测试
+pytest==8.3.2
+httpx==0.27.2  # FastAPI TestClient 依赖
+
+# 结果缓存（M4+：配 REDIS_URL 时启用 Redis，TTL=5min；未配降级进程内存 LRU 60s）
+redis>=5.0
+
+# 说明：
+# - sqlite3 为 Python 标准库，无需列出
+# - numpy 作为 faiss-cpu 的传递依赖自动安装，无需显式列出
+# - DashScope SDK 不强依赖：本项目通过 urllib 直接调用 HTTP 接口，仅需 DASHSCOPE_API_KEY 环境变量
+# - 无 DASHSCOPE_API_KEY 时自动走离线 fallback（本地 hash 向量 + 关键词重合 rerank），保证可演示
+# - 无 faiss-cpu 时 VectorIndex 自动降级为 Python dict + cosine_similarity 循环

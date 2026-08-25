@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EasySearch 实时性能大盘</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="dashboard-page">
+  <div class="container">
+    <header class="brand">
+      <h1>EasySearch 实时性能大盘</h1>
+      <p class="tagline">各阶段延迟 / QPS / 降级高亮 / DB 池占用 · SSE 1s 刷新</p>
+      <nav class="nav-links">
+        <a href="/">搜索</a>
+        <a href="/kb">知识库管理</a>
+      </nav>
+    </header>
+
+    <div class="dash-card" style="margin-top:18px;">
+      <span class="dash-stream-status" id="stream-status">
+        <span class="dot"></span>
+        <span id="stream-text">等待连接…</span>
+      </span>
+      <span class="sub" style="margin-left:16px;" id="last-update">—</span>
+    </div>
+
+    <div class="dash-grid">
+      <div class="dash-card" id="card-qps">
+        <p class="label">实时 QPS（最近 60s）</p>
+        <div class="value" id="m-qps">0.00</div>
+        <div class="sub" id="m-total">0 次请求</div>
+      </div>
+      <div class="dash-card" id="card-error">
+        <p class="label">错误率</p>
+        <div class="value" id="m-error">0.0%</div>
+        <div class="sub" id="m-errors-count">0 次错误</div>
+      </div>
+      <div class="dash-card" id="card-cache">
+        <p class="label">缓存命中率</p>
+        <div class="value" id="m-cache">0.0%</div>
+        <div class="sub" id="m-hits">命中 0</div>
+      </div>
+      <div class="dash-card" id="card-degraded">
+        <p class="label">降级计数</p>
+        <div class="value" id="m-degraded">0</div>
+        <div class="sub">空结果/缓存外的降级</div>
+      </div>
+      <div class="dash-card" id="card-p95">
+        <p class="label">端到端 P95</p>
+        <div class="value" id="m-p95">0 ms</div>
+        <div class="sub" id="m-p99">P99 0 ms</div>
+      </div>
+      <div class="dash-card" id="card-db">
+        <p class="label">DB 池占用 / Embedding</p>
+        <div class="value" id="m-db">0</div>
+        <div class="sub" id="m-emb">embedding 空闲</div>
+      </div>
+    </div>
+
+    <div class="dash-card">
+      <h3>各阶段延迟（P50 / P95 / P99，毫秒）</h3>
+      <table class="dash-stage-table">
+        <thead>
+          <tr><th>阶段</th><th>P50</th><th>P95</th><th>P99</th></tr>
+        </thead>
+        <tbody id="stage-body">
+          <tr><td colspan="4" class="empty-hint">等待数据…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="dash-card">
+      <h3>外部调用健康度</h3>
+      <div id="external-body">
+        <div class="empty-hint">等待数据…</div>
+      </div>
+    </div>
+  </div>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
