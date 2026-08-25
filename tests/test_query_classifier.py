@@ -353,6 +353,22 @@ class ApiIntentRoutingTests(unittest.TestCase):
         # 响应 query 字段仍为用户原始输入
         self.assertEqual(data["query"], "我想买基金")
 
+    def test_api_colloquial_skipped_when_query_matches_kb(self):
+        """安全网：LLM 误判标准术语为 colloquial，但 query 在 KB 中有命中 → 不 augment。"""
+        data = self._get(
+            FakeDeepSeekClient(
+                lambda url, payload: llm(
+                    '{"category":"colloquial","augmented_query":"订单 订单管理 审批"}'
+                )
+            ),
+            "订单",  # "订单" 是 svc-1 的别名，BM25 必命中
+        )
+        # intent_category 仍是 colloquial（LLM 分类结果不改），但 augmented_query 应为 None
+        self.assertEqual(data["intent_category"], "colloquial")
+        self.assertIsNone(data["augmented_query"])
+        # 检索用原 query → 正常命中 svc-1
+        self.assertTrue(len(data["results"]) > 0)
+
     def test_api_normal_financial_unchanged(self):
         data = self._get(
             FakeDeepSeekClient(
@@ -396,6 +412,44 @@ class ApiIntentRoutingTests(unittest.TestCase):
         self.assertEqual(data["intent_category"], "irrelevant")
         self.assertIsNotNone(data["not_found"])
         self.assertEqual(data["not_found"]["category"], "prompt_attack")
+        self.assertEqual(data["results"], [])
+
+    # ---------- 安全网：LLM 误判 irrelevant 时 BM25/子串拦截 ----------
+    def test_api_irrelevant_overridden_by_bm25_safety_net(self):
+        """LLM 把合法金融查询误判为 irrelevant，但 BM25 有命中 → 放行检索。"""
+        data = self._get(
+            FakeDeepSeekClient(
+                lambda url, payload: llm('{"category":"irrelevant","sub_category":"off_topic"}')
+            ),
+            "订单",  # "订单" 是 svc-1 的别名，BM25 必命中
+        )
+        # 安全网拦截 → 降级为 normal_financial → 走检索 → 返回结果
+        self.assertEqual(data["intent_category"], "normal_financial")
+        self.assertIsNone(data["not_found"])
+        self.assertTrue(len(data["results"]) > 0)
+
+    def test_api_irrelevant_overridden_by_substring_safety_net(self):
+        """LLM 误判 irrelevant，BM25 未命中但名称子串命中 → 放行检索。"""
+        data = self._get(
+            FakeDeepSeekClient(
+                lambda url, payload: llm('{"category":"irrelevant","sub_category":"off_topic"}')
+            ),
+            "订单中",  # "订单中" 是 "订单中心" 的子串（jieba 可能不拆出 "订单中" token）
+        )
+        self.assertEqual(data["intent_category"], "normal_financial")
+        self.assertIsNone(data["not_found"])
+        self.assertTrue(len(data["results"]) > 0)
+
+    def test_api_irrelevant_no_match_still_blocked(self):
+        """LLM 判 irrelevant 且 KB 无任何命中 → 仍返回 not_found（安全网不误放）。"""
+        data = self._get(
+            FakeDeepSeekClient(
+                lambda url, payload: llm('{"category":"irrelevant","sub_category":"off_topic"}')
+            ),
+            "请讲个笑话",  # 与 KB 服务完全无关
+        )
+        self.assertEqual(data["intent_category"], "irrelevant")
+        self.assertIsNotNone(data["not_found"])
         self.assertEqual(data["results"], [])
 
 

@@ -86,9 +86,9 @@ SPELL_MAX_DISTANCE: int = _env_int("EASYSEARCH_SPELL_MAX_DIST", "2")
 # ============================================================
 # M2 异步化 / reason 可选化
 # ============================================================
-# DeepSeek reason 默认关闭：reasoning_effort=high 端到端 2–8s 是 SLA 杀手；
-# 需要时置 EASYSEARCH_REASON_ENABLED=1 开启，并按 effort=low 流式返回。
-REASON_ENABLED: bool = _env_bool("EASYSEARCH_REASON_ENABLED", "0")
+# DeepSeek reason 默认开启：有 API Key 时由 LLM 生成差异化排序理由。
+# effort 默认 low（~0.5–1s）；无 Key / 失败自动降级到模板理由，不阻塞主链路。
+REASON_ENABLED: bool = _env_bool("EASYSEARCH_REASON_ENABLED", "1")
 # reason 推理强度：low（默认，~0.5–1s）/ medium / high（2–8s，不推荐线上默认）
 REASON_EFFORT: str = os.getenv("EASYSEARCH_REASON_EFFORT", "low")
 

@@ -23,7 +23,8 @@ _REASON_POSITIVE_HINTS = ("最相关", "最佳", "首选", "top1", "第一位", 
 class DeepSeekReasoner:
     """调用 deepseek-v4-flash 对比 Query 与 Top-20 候选内容，生成排序理由。
 
-    M2：reason 默认关闭（REASON_ENABLED=False），开启时 effort 默认 low（high 是 SLA 杀手）。
+    M2：reason 默认开启（REASON_ENABLED=True），有 API Key 时由 LLM 生成差异化理由。
+        无 Key / 失败时自动降级到模板理由。effort 默认 low（high 是 SLA 杀手）。
         提供 generate_reasons（同步，兼容旧链路）与 generate_reasons_async（并发 gather 用）。
     A7：prompt 中嵌入 rank + rerank_score，要求 LLM 按排序顺序生成 reason；
         后处理校验 rank=1 的 reason 不含负面词，矛盾则回退模板。
@@ -285,9 +286,8 @@ class Qwen3VLReranker:
     def _build_template_reason(query: str, item: dict[str, Any]) -> str:
         """基于 query token 在 item 各字段命中分布的差异化模板 reason。
 
-        REASON_ENABLED=False 时的默认理由（替代千篇一律的"综合相关性与关键词覆盖"）。
-        所有分支都拼"综合分X.XXXX。"尾巴，保前端展示一致性 + 分数透明。
-        REASON_ENABLED=True 时由 engine 层 LLM reason 覆盖（见 search_async）。
+        REASON_ENABLED=True 且有 API Key 时由 LLM 生成差异化理由。
+        无 Key / LLM 失败时回退到此模板。
         """
         score = item.get("rerank_score", item.get("score", 0.0))
         score_tail = f"综合分{score:.4f}。"

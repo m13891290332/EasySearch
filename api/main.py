@@ -19,6 +19,7 @@ from easysearch.logging_config import setup_logging
 from easysearch.metrics import get_metrics
 from easysearch.models import route_info
 from easysearch.safety import PromptInjectionError
+from easysearch.utils import tokenize
 
 from .schemas import (
     ActionExecuteRequest,
@@ -64,18 +65,31 @@ logger = logging.getLogger(__name__)
 _engine: ServiceSearchEngine | None = None
 _FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
 _DEFAULT_KB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "services_dict_50.json")
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+_ACTIVE_KB = os.path.join(_DATA_DIR, "active_kb.json")
+
+
+def _persist_kb(payload: list[dict[str, Any]]) -> None:
+    """将上传/导入的 KB 持久化到 data/active_kb.json，重启后自动加载。"""
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    with open(_ACTIVE_KB, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
 
 
 def get_engine() -> ServiceSearchEngine:
     global _engine
     if _engine is None:
-        data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-        os.makedirs(data_dir, exist_ok=True)
-        db_path = os.path.join(data_dir, "easysearch.db")
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        db_path = os.path.join(_DATA_DIR, "easysearch.db")
         _engine = ServiceSearchEngine(db_path=db_path)
-        kb_path = os.getenv("EASYSEARCH_KB", _DEFAULT_KB)
-        if os.path.exists(kb_path):
+        # 优先加载用户上传的持久化 KB，其次环境变量指定的 KB，最后默认 KB
+        kb_path = os.getenv("EASYSEARCH_KB", "")
+        if kb_path and os.path.exists(kb_path):
             _engine.upload_knowledge_base_from_json(kb_path)
+        elif os.path.exists(_ACTIVE_KB):
+            _engine.upload_knowledge_base_from_json(_ACTIVE_KB)
+        elif os.path.exists(_DEFAULT_KB):
+            _engine.upload_knowledge_base_from_json(_DEFAULT_KB)
     return _engine
 
 
@@ -199,19 +213,34 @@ def create_app() -> FastAPI:
 
         # 需求3：无关消息 / 无关 prompt / 提示词攻击 → 未命中提示，不胡编不存在服务
         if intent_category == "irrelevant":
-            return SearchResponse(
-                user_id=user_id,
-                query=query,
-                intent="irrelevant",
-                intent_category="irrelevant",
-                match_mode="not_found",
-                not_found=NotFoundInfo(
-                    message="未命中：您查询的内容不在金融服务范围内，未找到相关服务。",
-                    category=classification.sub_category or "off_topic",
-                    hint="请输入与平台金融服务相关的查询，例如：开户、银证转账、新股申购。",
-                ),
-                results=[],
-            )
+            # 安全网：LLM 可能误判金融查询为 irrelevant（如 "大宗" 被判无关，
+            # 但 KB 有 "大宗交易"）。先做 BM25 + 名称/别名子串匹配，
+            # 有命中则降级为 normal_financial 继续检索，不阻断。
+            _q_tokens = tokenize(query)
+            _bm25 = engine._mf_bm25.batch_score_tokens(_q_tokens) if _q_tokens else {}
+            _has_bm25 = any(s > 0 for s in _bm25.values())
+            _ql = query.lower().strip()
+            _has_substr = any(
+                _ql in svc.service_name.lower()
+                or any(_ql in a.lower() for a in svc.aliases)
+                for svc in engine.services.values()
+            ) if _ql else False
+            if not _has_bm25 and not _has_substr:
+                return SearchResponse(
+                    user_id=user_id,
+                    query=query,
+                    intent="irrelevant",
+                    intent_category="irrelevant",
+                    match_mode="not_found",
+                    not_found=NotFoundInfo(
+                        message="未命中：您查询的内容不在金融服务范围内，未找到相关服务。",
+                        category=classification.sub_category or "off_topic",
+                        hint="请输入与平台金融服务相关的查询，例如：开户、银证转账、新股申购。",
+                    ),
+                    results=[],
+                )
+            # BM25 或子串命中 → LLM 误判，降级为正常检索
+            intent_category = "normal_financial"
 
         # 需求2：泛化需求组合回复 → 每步 top1 按序组合为卡片包组
         if (
@@ -243,16 +272,28 @@ def create_app() -> FastAPI:
         # 正常金融服务查找 / 口语化查找 → 既有规则意图路由 + 检索
         # colloquial：用「按金融术语理解 + 追加金融名词」后的 augmented_query 做检索，
         # 其余用原 query（normal_financial 下与原行为完全一致）。
-        effective_query = (
-            classification.augmented_query
-            if intent_category == "colloquial" and classification.augmented_query
-            else query
-        )
-        augmented_query = (
-            classification.augmented_query
-            if intent_category == "colloquial" and classification.augmented_query
-            else None
-        )
+        # 安全网：若原始 query 已在 KB 中有 BM25/子串命中（说明是标准术语），
+        # 则不 augment，避免 LLM 追加无关词稀释检索。
+        if intent_category == "colloquial" and classification.augmented_query:
+            _q_tokens = tokenize(query)
+            _bm25 = engine._mf_bm25.batch_score_tokens(_q_tokens) if _q_tokens else {}
+            _has_bm25 = any(s > 0 for s in _bm25.values())
+            _ql = query.lower().strip()
+            _has_substr = any(
+                _ql in svc.service_name.lower()
+                or any(_ql in a.lower() for a in svc.aliases)
+                for svc in engine.services.values()
+            ) if _ql else False
+            if _has_bm25 or _has_substr:
+                # query 已是标准术语，不需要 augment
+                effective_query = query
+                augmented_query = None
+            else:
+                effective_query = classification.augmented_query
+                augmented_query = classification.augmented_query
+        else:
+            effective_query = query
+            augmented_query = None
         # M5：规则意图识别（navigational 直达 / multi_condition 转 M6 / conversational 转 M7）
         intent_result = engine.classify_intent(
             effective_query, user_id=user_id, session_id=session_id
@@ -637,8 +678,8 @@ def create_app() -> FastAPI:
         """M10-5：reason 流式端点（M2 懒加载用）。
 
         前端卡片展开时调用，SSE 流式返回排序理由 + 阶段计时。
-        - REASON_ENABLED 关闭（默认）→ 立即返回模板理由（单事件）
-        - REASON_ENABLED 开启且 DashScope 可用 → LLM 生成理由，按字符块增量推送
+        - REASON_ENABLED 开启（默认）且有 API Key → LLM 生成理由，按字符块增量推送
+        - 无 API Key / LLM 失败 → 立即返回模板理由
         - 服务不在 KB → error 事件（前端降级展示模板理由）
         每次调用经 engine.metrics 记录 reason 阶段耗时（不记为 search 事件）。
         """
@@ -732,6 +773,7 @@ def create_app() -> FastAPI:
         engine = get_engine()
         payload: list[dict[str, Any]] = [item.model_dump() for item in items]
         engine.load_knowledge_base(payload)
+        _persist_kb(payload)
         return UploadResponse(status="ok", services_count=len(engine.services))
 
     # ---------- M9 知识库管理：导入导出 / 版本 / embedding 状态 ----------
@@ -750,6 +792,7 @@ def create_app() -> FastAPI:
             result = engine.import_kb_version(payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        _persist_kb(payload)
         logger.info(
             "kb_import version=%s hash=%s services=%s",
             result["version_id"],
@@ -812,6 +855,8 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"version not found: {version_id}"
             )
+        # 同步持久化回滚后的 KB
+        _persist_kb([s.to_dict() for s in engine.services.values()])
         logger.info(
             "kb_rollback version=%s hash=%s services=%s",
             result["version_id"],

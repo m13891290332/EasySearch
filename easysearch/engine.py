@@ -1823,7 +1823,8 @@ class ServiceSearchEngine:
                 ]
                 stages["rerank_reason"] = (time.time() - t_rerank) * 1000
             else:
-                # hybrid：rerank 与 reason 并发 gather（reason 默认关闭即模板，REASON_ENABLED=True 时 LLM 覆盖）
+                # hybrid：rerank 与 reason 并发 gather（REASON_ENABLED 默认开启，
+                # 有 API Key 时 LLM 生成差异化理由，无 Key/失败降级模板）
                 reranked, reasons = await asyncio.gather(
                     self.reranker.rerank_async(q, top20),
                     self.reasoner.generate_reasons_async(q, top20),
