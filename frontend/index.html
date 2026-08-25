@@ -7,15 +7,51 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+  <!-- 暗色模式动态着色器背景（theme.js 控制） -->
+  <canvas id="bg-canvas" aria-hidden="true"></canvas>
+
+  <!-- 右上角齿轮：账号 / 搜索配置 / 主题 -->
+  <button id="gear-btn" class="gear spotlight" type="button" title="设置" aria-label="设置">⚙</button>
+  <aside id="settings-panel" class="glass settings-panel" hidden>
+    <h2>设置</h2>
+    <div class="set-section">
+      <label for="set-user">账号（user_id）</label>
+      <input id="set-user" type="text" autocomplete="off" placeholder="u-demo" />
+      <p class="settings-hint">变更后会以新账号重新加载页面。</p>
+    </div>
+    <div class="set-section">
+      <label for="set-retrieval-mode">默认检索模式</label>
+      <select id="set-retrieval-mode">
+        <option value="hybrid">混合检索</option>
+        <option value="keyword">仅关键词</option>
+        <option value="semantic">仅语义</option>
+      </select>
+    </div>
+    <div class="set-section">
+      <label>主题</label>
+      <div class="theme-options">
+        <label><input type="radio" name="theme" value="light" /><span>亮色</span></label>
+        <label><input type="radio" name="theme" value="dark" /><span>暗色</span></label>
+        <label><input type="radio" name="theme" value="custom" /><span>自定义</span></label>
+      </div>
+      <div class="set-file-row">
+        <input id="set-bg-url" type="url" placeholder="背景图 URL" />
+        <input id="set-bg-file" type="file" accept="image/*" />
+        <button id="set-bg-btn" class="set-file-btn" type="button" title="选择本地图片">本地上传</button>
+      </div>
+      <p class="settings-hint">亮色：每次进入随机渐变；暗色：动态着色器；自定义：贴背景图。开启系统「减弱动态效果」时将关闭动画。</p>
+    </div>
+  </aside>
+
   <main class="container">
     <header class="brand">
-      <h1>EasySearch</h1>
+      <h1 data-text="EasySearch">EasySearch</h1>
       <p class="tagline">平台内服务搜索引擎 · 向量 + BM25 混合检索 · qwen3-vl-rerank 重排</p>
       <p class="nav-links"><a href="/kb">知识库管理</a></p>
     </header>
 
     <section class="search-box">
-      <div class="query-wrap">
+      <div class="query-wrap spotlight">
         <span id="suggest-ghost" class="suggest-ghost" aria-hidden="true"></span>
         <input
           id="query"
@@ -24,15 +60,27 @@
           placeholder="搜索服务，如：开户、银证转账、新股新债…"
         />
       </div>
-      <button id="search-btn" type="button">搜索</button>
+      <button id="search-btn" class="spotlight" type="button">搜索</button>
       <select id="retrieval-mode" class="retrieval-mode-select" title="检索模式：keyword=仅关键词 / semantic=仅语义 / hybrid=混合">
         <option value="hybrid" selected>混合检索</option>
         <option value="keyword">仅关键词</option>
         <option value="semantic">仅语义</option>
       </select>
-      <button id="session-toggle" type="button" class="btn-session" title="开启多轮对话：首轮宽召回，后续轮基于上下文精化，可撤回">
+      <button id="advanced-toggle" class="advanced-toggle" type="button" title="多条件交集搜索：各条件同时满足">高级搜索</button>
+      <button id="session-toggle" type="button" class="btn-session spotlight" title="开启多轮对话：首轮宽召回，后续轮基于上下文精化，可撤回">
         会话模式：关
       </button>
+    </section>
+
+    <!-- 高级多条件搜索：右侧 +/- 增减搜索行 -->
+    <section id="advanced-panel" class="glass advanced-panel" hidden>
+      <h3>多条件同时满足</h3>
+      <p class="mc-hint">每个条件独立召回 Top-30，求交集（为空则 RRF 并集兜底），再经 qwen3-vl-rerank 重排 + 理由生成，取 Top-10。</p>
+      <div id="mc-rows" class="mc-rows"></div>
+      <div class="mc-actions">
+        <button id="mc-search" class="mc-search-btn" type="button">多条件搜索</button>
+        <span class="badge">至少 2 个条件</span>
+      </div>
     </section>
 
     <section id="session-panel" class="session-panel" hidden>
@@ -68,6 +116,7 @@
     </footer>
   </main>
 
+  <script src="/static/theme.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

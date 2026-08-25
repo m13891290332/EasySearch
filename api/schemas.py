@@ -152,6 +152,19 @@ class SessionSearchResponse(BaseModel):
     history: list[SessionTurnSummary] = Field(default_factory=list)
 
 
+class IntersectionSearchRequest(BaseModel):
+    """M6 高级多条件交集搜索：用户经前端 +/- 行显式输入多个子查询。
+
+    后端复用 ``engine.search_intersection_async``（每子查询独立 Top-30 召回 →
+    求交集，空交集降级 union → qwen3-vl-rerank 重排 + 理由生成 → MMR Top-10）。
+    响应复用 ``SearchResponse``，含 ``sub_queries`` / ``match_mode`` / results。
+    """
+
+    user_id: str
+    queries: list[str]
+    original_query: str | None = None
+
+
 class DropdownItem(BaseModel):
     service_id: str
     service_name: str

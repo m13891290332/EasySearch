@@ -299,6 +299,12 @@ function toggleSession() {
     panel.hidden = false;
     renderSessionTurns([], -1);
     $("rollback-btn").disabled = true;
+    // 多条件与会话互斥：开启会话时收起高级搜索面板
+    const advPanel = $("advanced-panel");
+    if (advPanel) {
+      advPanel.hidden = true;
+      $("advanced-toggle").classList.remove("active");
+    }
     $("status").textContent = "会话模式已开启，输入查询开始多轮对话";
   } else {
     sessionId = null;
@@ -643,6 +649,122 @@ function isSafeRoute(route) {
   return true; // 无 scheme：相对路径
 }
 
+// ---------- 高级多条件搜索：+/- 行 + 多条件交集检索（M6） ----------
+// 各条件独立召回 Top-30 求交集（空则 RRF 并集兜底）→ qwen3-vl-rerank 重排 + 理由生成
+const MC_MIN_ROWS = 2;
+const mcRows = () => document.querySelectorAll("#mc-rows .mc-row");
+
+// 重排行号占位 + 最少行数时禁用减号
+function refreshMCRows() {
+  const rows = mcRows();
+  rows.forEach((row, i) => {
+    const input = row.querySelector(".mc-input");
+    if (input) input.placeholder = `条件 ${i + 1}`;
+    const rm = row.querySelector(".mc-rm");
+    if (rm) rm.disabled = rows.length <= MC_MIN_ROWS;
+  });
+}
+
+function makeMCRow(value = "", focus = false) {
+  const row = document.createElement("div");
+  row.className = "mc-row";
+  const input = document.createElement("input");
+  input.className = "mc-input";
+  input.type = "text";
+  input.autocomplete = "off";
+  input.placeholder = "条件 N";
+  input.value = value;
+  const addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.className = "mc-add";
+  addBtn.textContent = "+";
+  addBtn.title = "增加一行";
+  addBtn.addEventListener("click", () => {
+    // 在当前行后插入新空行并聚焦
+    const fresh = makeMCRow("", true);
+    row.after(fresh);
+    refreshMCRows();
+  });
+  const rmBtn = document.createElement("button");
+  rmBtn.type = "button";
+  rmBtn.className = "mc-rm";
+  rmBtn.textContent = "−";
+  rmBtn.title = "删除该行";
+  rmBtn.addEventListener("click", () => {
+    if (mcRows().length <= MC_MIN_ROWS) return;
+    row.remove();
+    refreshMCRows();
+  });
+  row.append(input, addBtn, rmBtn);
+  $("mc-rows").appendChild(row);
+  refreshMCRows();
+  if (focus) input.focus();
+  return row;
+}
+
+function initMCRows() {
+  $("mc-rows").innerHTML = "";
+  makeMCRow();
+  makeMCRow();
+}
+
+function toggleAdvanced() {
+  const panel = $("advanced-panel");
+  const btn = $("advanced-toggle");
+  const open = panel.hidden;
+  panel.hidden = !open;
+  btn.classList.toggle("active", open);
+  // 多条件与会话互斥：开启高级搜索时关闭会话模式
+  if (open && sessionActive) toggleSession();
+}
+
+async function doMultiConditionSearch() {
+  flushPendingDwell();
+  const queries = Array.from(mcRows())
+    .map((r) => r.querySelector(".mc-input").value.trim())
+    .filter(Boolean);
+  if (queries.length < 2) {
+    $("status").textContent = "至少需要 2 个非空条件";
+    return;
+  }
+  const original = queries.join(" ");
+  $("status").textContent = "多条件检索中…";
+  $("results").innerHTML = "";
+  renderSpellSuggestion(null, "");
+  const btn = $("mc-search");
+  btn.disabled = true;
+  try {
+    const data = await postJson(`${API}/search/intersection`, {
+      user_id: userId,
+      queries,
+      original_query: original,
+    });
+    renderResults(data.results || [], false, original);
+    // 顶部加交集/并集命中徽章
+    const box = $("results");
+    const head = document.createElement("div");
+    head.className = "card";
+    head.style.padding = "8px 14px";
+    const isInter = data.match_mode === "intersection";
+    const label = isInter
+      ? "交集命中（各条件同时满足）"
+      : "并集兜底（无交集，RRF 融合）";
+    head.innerHTML =
+      `<span class="badge badge-match">${escapeHtml(data.match_mode)}</span> ` +
+      `<span class="badge">${escapeHtml(label)}</span>`;
+    box.insertBefore(head, box.firstChild);
+    renderSpellSuggestion(data.spell_suggestion, original);
+    $("status").textContent =
+      `多条件 · ${data.match_mode} · ${(data.results || []).length} 条结果`;
+  } catch (err) {
+    $("results").innerHTML = `<div class="error">多条件搜索失败：${err.message}</div>`;
+    $("status").textContent = "多条件搜索失败";
+  } finally {
+    btn.disabled = false;
+  }
+  loadDropdown();
+}
+
 // 事件绑定
 $("search-btn").addEventListener("click", () => doSearch());
 $("query").addEventListener("input", scheduleSuggest);
@@ -674,9 +796,12 @@ $("query").addEventListener("blur", () => {
 });
 $("session-toggle").addEventListener("click", () => toggleSession());
 $("rollback-btn").addEventListener("click", () => rollbackSession());
+$("advanced-toggle").addEventListener("click", () => toggleAdvanced());
+$("mc-search").addEventListener("click", () => doMultiConditionSearch());
 // M13：页面关闭/刷新时尽力上报最后一条结果的 dwell time（keepalive 保活）
 window.addEventListener("pagehide", () => flushPendingDwell());
 
 // 初始化
+initMCRows();       // 高级多条件搜索初始 2 行
 loadHealth();
 loadDropdown();

@@ -31,6 +31,7 @@ from .schemas import (
     FeedbackRequest,
     HealthResponse,
     HighLatencyQueryStat,
+    IntersectionSearchRequest,
     KBImportResponse,
     KBOpLogItem,
     KBRollbackResponse,
@@ -336,6 +337,65 @@ def create_app() -> FastAPI:
                 {"turn_idx": t["turn_idx"], "query": t["query"]}
                 for t in result.get("history", [])
             ],
+        )
+
+    @app.post(
+        "/api/search/intersection",
+        response_model=SearchResponse,
+        tags=["search"],
+    )
+    async def search_intersection(
+        payload: IntersectionSearchRequest,
+    ) -> SearchResponse:
+        """M6 高级多条件交集搜索端点。
+
+        前端 +/- 行输入多个子查询后直接调用本端点（不经意图分词自动路由）。
+        复用 ``engine.search_intersection_async``：每子查询独立 Top-30 召回 →
+        求交集（空降级 RRF union）→ qwen3-vl-rerank 重排 + 理由生成并发 →
+        MMR Top-10。空交集返回空结果 + ``match_mode=union``。
+        """
+        engine = get_engine()
+        if not engine.services:
+            raise HTTPException(status_code=409, detail="知识库为空，请先上传")
+        # 去空去重（保序），至少 2 条非空子查询才进入交集逻辑
+        seen: set[str] = set()
+        clean: list[str] = []
+        for q in payload.queries:
+            s = (q or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                clean.append(s)
+        if len(clean) < 2:
+            raise HTTPException(
+                status_code=400, detail="至少需要 2 个非空子查询"
+            )
+        original = payload.original_query or " ".join(clean)
+        try:
+            results, match_mode = await engine.search_intersection_async(
+                user_id=payload.user_id,
+                queries=clean,
+                original_query=original,
+            )
+        except PromptInjectionError as exc:
+            # M1：提示词注入命中 → 400，不穿透 500、不泄露后端细节
+            raise HTTPException(status_code=400, detail=str(exc))
+        # M14：单请求 timing——从最近一次 metrics 事件旁路提取（不破坏 list[dict] 返回契约）
+        last_event = (
+            engine.metrics.events()[-1] if engine.metrics.events() else None
+        )
+        timing = last_event["stages"] if last_event else None
+        # M13：拼写建议（多条件场景同样适用）
+        spell_suggestion = engine.spell_suggest(original)
+        return SearchResponse(
+            user_id=payload.user_id,
+            query=original,
+            intent="multi_condition",
+            sub_queries=clean,
+            match_mode=match_mode,
+            retrieval_mode="hybrid",
+            results=[SearchResultItem(**item) for item in results],
+            spell_suggestion=spell_suggestion,
+            timing=timing,
         )
 
     @app.get("/api/dropdown", response_model=DropdownResponse, tags=["search"])

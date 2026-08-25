@@ -13,7 +13,7 @@
         ▼
 混合检索: score = 0.6·向量相似度 + 0.3·BM25 + 0.1·热门性  ──► Top-20
         ▼
-qwen3-vl-rerank 重排 + qwen3-vl-plus 生成排序理由  ──► Top-10
+qwen3-vl-rerank 重排 + deepseek 生成排序理由  ──► Top-10
         ▼
 前端结果页：可点击路径 / 页面组件 / 决策执行按钮 / 排序理由
 ```
@@ -27,7 +27,7 @@ easysearch/        核心库
   ├ embedding.py    qwen3.7-text-embedding（批量 + 离线 fallback）
   ├ bm25.py         BM25 倒排索引（jieba 中文分词）
   ├ din.py          DIN 历史序列注意力（阈值 > 10）
-  ├ reranker.py     qwen3-vl-rerank + qwen3-vl-plus 排序理由
+  ├ reranker.py     qwen3-vl-rerank + deepseek 排序理由
   ├ store.py        SQLite 持久化（查询/点击/全局热门）
   └ engine.py       ServiceSearchEngine 编排
 api/               FastAPI 后端
