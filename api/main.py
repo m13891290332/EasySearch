@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -23,7 +24,12 @@ from .schemas import (
     ActionExecuteRequest,
     ActionExecuteResponse,
     AnswerGuide,
+    AutocompleteItem,
+    AutocompleteResponse,
+    AutocompleteTag,
     ClickRequest,
+    CombinationGroup,
+    CombinationStep,
     DegradationStats,
     DeepComponentItem,
     DeepComponentRequest,
@@ -41,6 +47,7 @@ from .schemas import (
     KBVersionInfo,
     KnowledgeBaseItem,
     NoClickQueryStat,
+    NotFoundInfo,
     SearchLogItem,
     SearchResponse,
     SearchResultItem,
@@ -183,9 +190,72 @@ def create_app() -> FastAPI:
         engine = get_engine()
         if not engine.services:
             raise HTTPException(status_code=409, detail="知识库为空，请先上传")
-        # M5：意图识别（navigational 直达 / multi_condition 转 M6 / conversational 转 M7）
+        # 需求1：DeepSeek 语义意图预分类——query 进入检索前的第一道分类。
+        # normal_financial/colloquial → 既有规则路由 + 检索；
+        # generalized_combination → 组合卡片包组（需求2）；
+        # irrelevant → 未命中提示，不调检索、不胡编服务（需求3）。
+        classification = await engine.classify_query_async(query)
+        intent_category = classification.category
+
+        # 需求3：无关消息 / 无关 prompt / 提示词攻击 → 未命中提示，不胡编不存在服务
+        if intent_category == "irrelevant":
+            return SearchResponse(
+                user_id=user_id,
+                query=query,
+                intent="irrelevant",
+                intent_category="irrelevant",
+                match_mode="not_found",
+                not_found=NotFoundInfo(
+                    message="未命中：您查询的内容不在金融服务范围内，未找到相关服务。",
+                    category=classification.sub_category or "off_topic",
+                    hint="请输入与平台金融服务相关的查询，例如：开户、银证转账、新股申购。",
+                ),
+                results=[],
+            )
+
+        # 需求2：泛化需求组合回复 → 每步 top1 按序组合为卡片包组
+        if (
+            intent_category == "generalized_combination"
+            and classification.combination_steps
+        ):
+            step_bundles = await engine.search_combination_async(
+                user_id, classification.combination_steps
+            )
+            combo_steps = [
+                CombinationStep(
+                    step_label=b["step_label"],
+                    step_query=b["step_query"],
+                    results=[SearchResultItem(**it) for it in b["results"]],
+                )
+                for b in step_bundles
+            ]
+            title = "组合查找：" + " → ".join(classification.combination_steps)
+            return SearchResponse(
+                user_id=user_id,
+                query=query,
+                intent="generalized_combination",
+                intent_category="generalized_combination",
+                match_mode="combination",
+                combination=CombinationGroup(title=title, steps=combo_steps),
+                results=[],
+            )
+
+        # 正常金融服务查找 / 口语化查找 → 既有规则意图路由 + 检索
+        # colloquial：用「按金融术语理解 + 追加金融名词」后的 augmented_query 做检索，
+        # 其余用原 query（normal_financial 下与原行为完全一致）。
+        effective_query = (
+            classification.augmented_query
+            if intent_category == "colloquial" and classification.augmented_query
+            else query
+        )
+        augmented_query = (
+            classification.augmented_query
+            if intent_category == "colloquial" and classification.augmented_query
+            else None
+        )
+        # M5：规则意图识别（navigational 直达 / multi_condition 转 M6 / conversational 转 M7）
         intent_result = engine.classify_intent(
-            query, user_id=user_id, session_id=session_id
+            effective_query, user_id=user_id, session_id=session_id
         )
         match_mode = "default"
         session_turn_idx: int | None = None
@@ -200,7 +270,7 @@ def create_app() -> FastAPI:
                 session_result = await engine.search_session_async(
                     session_id=session_id,
                     user_id=user_id,
-                    query=query,
+                    query=effective_query,
                     action="search",
                 )
                 results = session_result["results"]
@@ -212,7 +282,7 @@ def create_app() -> FastAPI:
             ):
                 # M16：指引型意图 → LLM 步骤化答案（失败降级 list 模式）
                 guide_result = await engine.search_guide_async(
-                    user_id=user_id, query=query
+                    user_id=user_id, query=effective_query
                 )
                 results = guide_result["results"]
                 if guide_result["answer_guide"]:
@@ -231,14 +301,16 @@ def create_app() -> FastAPI:
                 results, match_mode = await engine.search_intersection_async(
                     user_id=user_id,
                     queries=intent_result.sub_queries,
-                    original_query=query,
+                    original_query=effective_query,
                 )
             else:
                 # M2：默认异步路径，rerank 与 reason 并发 gather
                 # retrieval_mode 仅在此默认分支透传；session/guide/multi_condition 分支
                 # 是意图路由与 retrieval_mode 正交，本期默认 hybrid 保现有行为
                 results = await engine.search_async(
-                    user_id=user_id, query=query, retrieval_mode=retrieval_mode
+                    user_id=user_id,
+                    query=effective_query,
+                    retrieval_mode=retrieval_mode,
                 )
         except PromptInjectionError as exc:
             # M1：提示词注入命中 → 400，不穿透 500、不泄露后端细节
@@ -248,7 +320,7 @@ def create_app() -> FastAPI:
         deep_reason = (results[0].get("deep_reason") if results else "") or ""
         # M13：拼写建议（仅 list 模式给；guide 答案模式不打扰）
         spell_suggestion = (
-            None if answer_guide is not None else engine.spell_suggest(query)
+            None if answer_guide is not None else engine.spell_suggest(effective_query)
         )
         # M14：单请求 timing——从最近一次 metrics 事件提取（单 worker 下即本请求）。
         # engine.search 返回 list[dict] 不变，timing 经 metrics 旁路提取，不破坏兼容。
@@ -261,6 +333,8 @@ def create_app() -> FastAPI:
             sub_queries=intent_result.sub_queries,
             match_mode=match_mode,
             retrieval_mode=retrieval_mode,
+            intent_category=intent_category,
+            augmented_query=augmented_query,
             deep_searched=deep_searched,
             deep_reason=deep_reason,
             session_id=session_id,
@@ -481,6 +555,43 @@ def create_app() -> FastAPI:
             return SuggestResponse(completion=completion, source="llm")
         return SuggestResponse(completion="", source="none")
 
+    @app.get(
+        "/api/search/autocomplete",
+        response_model=AutocompleteResponse,
+        tags=["search"],
+    )
+    async def search_autocomplete(
+        user_id: str = Query(..., description="用户ID"),
+        query: str = Query(
+            ...,
+            min_length=1,
+            max_length=100,
+            description="已输入的查询（每次修改 query 触发，尚未点击搜索）",
+        ),
+    ) -> AutocompleteResponse:
+        """搜索框自动补全：边输入边返回 top-10 推荐服务。
+
+        每行只展示匹配到、标蓝的 service_name 或 alias（点击进入路由占位视图），
+        不生成排序理由，改为右侧 4 种红色标签：关键词完全匹配 / 语义相似（>0.5）/
+        过去常点 / 意图匹配。autocomplete ≠ 真实搜索，不记查询历史、不触结果缓存。
+        engine.autocomplete 为同步实现（embed/bm25/local_rerank 全同步），
+        经 asyncio.to_thread 包装避免阻塞事件循环（单 worker 下不卡其他请求）。
+        """
+        engine = get_engine()
+        if not engine.services:
+            raise HTTPException(status_code=409, detail="知识库为空，请先上传")
+        q = query.strip()
+        if not q:
+            return AutocompleteResponse(query=query, items=[])
+        try:
+            items = await asyncio.to_thread(engine.autocomplete, user_id, q, 10)
+        except PromptInjectionError as exc:
+            # M1：提示词注入命中 → 400，不穿透 500、不泄露后端细节
+            raise HTTPException(status_code=400, detail=str(exc))
+        return AutocompleteResponse(
+            query=query, items=[AutocompleteItem(**it) for it in items]
+        )
+
     @app.get("/api/service", response_model=ServiceDetail, tags=["search"])
     def get_service(service_id: str = Query(..., description="服务ID")) -> ServiceDetail:
         """按 service_id 直接返回服务详情（不经检索/rerank），供下拉点击直接进入。"""
@@ -489,6 +600,30 @@ def create_app() -> FastAPI:
         if item is None:
             raise HTTPException(status_code=404, detail=f"service not found: {service_id}")
         return ServiceDetail(**item)
+
+    @app.get("/api/service/related", response_model=list[ServiceDetail], tags=["search"])
+    def service_related(
+        service_id: str = Query(..., description="服务ID"),
+        k: int = Query(3, ge=1, le=10, description="返回条数（默认 3）"),
+    ) -> list[ServiceDetail]:
+        """路由占位视图：返回与该服务最相关的 top-k 服务（离线预计算 cosine top-3）。
+
+        测试环境下所有 route 界面不可访问，进入路由界面时用搜索结果卡片临时代替，
+        下方展示该服务相关性最高的 3 个服务卡片。预计算在 KB 加载时完成并落盘，
+        进入 route 界面直接复用（O(1) 查表），提速。
+        """
+        engine = get_engine()
+        if not engine.services:
+            raise HTTPException(status_code=409, detail="知识库为空，请先上传")
+        items = engine.get_related_services(service_id, k=k)
+        if not items:
+            # service 不存在 或 无相关服务（KB 仅 1 个服务时）
+            if engine.services.get(service_id) is None:
+                raise HTTPException(
+                    status_code=404, detail=f"service not found: {service_id}"
+                )
+            return []
+        return [ServiceDetail(**it) for it in items]
 
     @app.get("/api/reason", tags=["search"])
     async def reason_stream(

@@ -124,6 +124,14 @@ let currentSuggestion = null;    // { partial, completion } 或 null
 let composing = false;           // IME 合成态标记（合成期不发请求）
 const SUGGEST_DEBOUNCE_MS = 200;
 
+// 搜索框自动补全下拉（10 行推荐服务 + 4 红色标签，不生成排序理由）
+let acTimer = null;
+let acRequestId = 0;             // 单调递增，丢弃过期响应防闪烁
+const AC_DEBOUNCE_MS = 200;
+
+// 路由占位视图「返回搜索结果」用：缓存上一轮搜索（query + results + isDirect）
+let lastSearch = null;
+
 function clearSuggestion() {
   currentSuggestion = null;
   $("suggest-ghost").textContent = "";
@@ -181,6 +189,93 @@ function acceptSuggestion() {
   return false;
 }
 
+// ---------- 搜索框自动补全：边输入边出现 10 行推荐服务 ----------
+// 每行只展示匹配到、标蓝的 service_name 或 alias，右侧 4 红色标签；
+// 点击 name/alias 直接进入路由占位视图（route 不可达时用相关服务卡代替）。
+function scheduleAutocomplete() {
+  clearTimeout(acTimer);
+  if (composing) return;          // 中文合成中不请求
+  const partial = $("query").value.trim();
+  if (!partial || partial.length > 100) {
+    hideAutocomplete();
+    // 输入清空且搜索框仍聚焦 → 重新展示「最近搜索/最近点击/热门服务」下拉
+    if (!partial && document.activeElement === $("query")) loadDropdown();
+    return;
+  }
+  acTimer = setTimeout(() => requestAutocomplete(partial), AC_DEBOUNCE_MS);
+}
+
+function hideAutocomplete() {
+  const box = $("autocomplete");
+  if (box) box.hidden = true;
+  const ul = $("autocomplete-list");
+  if (ul) ul.innerHTML = "";
+}
+
+async function requestAutocomplete(partial) {
+  const myId = ++acRequestId;
+  try {
+    const url =
+      `${API}/search/autocomplete?user_id=${encodeURIComponent(userId)}` +
+      `&query=${encodeURIComponent(partial)}`;
+    const data = await getJson(url);
+    if (myId !== acRequestId) return;   // 过期响应丢弃（竞态防护）
+    if ($("query").value.trim() !== partial) return;  // 输入已变
+    renderAutocomplete(data.items || [], partial);
+  } catch (_err) {
+    hideAutocomplete();            // 静默失败，不打扰输入体验
+  }
+}
+
+// 4 标签固定展示顺序 + 样式类映射
+const AC_TAG_ORDER = [
+  { key: "exact", cls: "ac-exact" },
+  { key: "semantic", cls: "ac-semantic" },
+  { key: "click", cls: "ac-click" },
+  { key: "intent", cls: "ac-intent" },
+];
+
+function renderAutocomplete(items, query) {
+  const ul = $("autocomplete-list");
+  ul.innerHTML = "";
+  if (!items.length) {
+    hideAutocomplete();
+    return;
+  }
+  items.forEach((it) => {
+    const li = document.createElement("li");
+    li.className = "ac-row";
+    // 左：匹配到的 name/alias（标蓝高亮 query 命中），点击进入路由占位
+    const left = document.createElement("button");
+    left.className = "ac-match-btn";
+    left.type = "button";
+    left.title = `${it.service_name} · ${it.route || ""}`;
+    left.innerHTML =
+      `<span class="ac-type-badge">${it.matched_type === "alias" ? "别名" : "服务"}</span>` +
+      `<span class="ac-match-text">${highlight(it.matched_text, query)}</span>`;
+    left.addEventListener("click", () => enterRoute(it.service_id));
+    // 右：4 红色标签（按固定顺序渲染命中的）
+    const tags = document.createElement("div");
+    tags.className = "ac-tags";
+    const tagMap = {};
+    (it.tags || []).forEach((t) => { tagMap[t.key] = t.label; });
+    AC_TAG_ORDER.forEach((spec) => {
+      if (tagMap[spec.key]) {
+        const tag = document.createElement("span");
+        tag.className = `ac-tag ${spec.cls}`;
+        tag.textContent = tagMap[spec.key];
+        tags.appendChild(tag);
+      }
+    });
+    li.append(left, tags);
+    ul.appendChild(li);
+  });
+  $("autocomplete").hidden = false;
+  // autocomplete 与「最近搜索」下拉互斥：展示推荐服务时隐藏 dropdown，避免层叠遮挡
+  const dd = $("dropdown");
+  if (dd) dd.hidden = true;
+}
+
 async function doSearch(query) {
   flushPendingDwell();  // M13：开始新搜索前上报上一条结果的 dwell time
   query = (query || $("query").value).trim();
@@ -199,14 +294,31 @@ async function doSearch(query) {
       `${API}/search?user_id=${encodeURIComponent(userId)}` +
       `&query=${encodeURIComponent(query)}&retrieval_mode=${encodeURIComponent(retrievalMode)}`
     );
-    if (data.answer_guide && (data.answer_guide.steps || []).length) {
+    // 需求3：无关消息 / 无关 prompt / 提示词攻击 → 未命中提示，不胡编服务
+    if (data.not_found) {
+      renderSpellSuggestion(null, "");
+      renderNotFound(data.not_found, query);
+      $("status").textContent = "未命中";
+      lastSearch = { query, results: null, isDirect: false };
+    } else if (data.combination && (data.combination.steps || []).length) {
+      // 需求2：泛化需求组合回复 → 每步 top1 卡片包组（按步骤顺序）
+      renderSpellSuggestion(null, "");
+      renderCombination(data.combination, query);
+      $("status").textContent =
+        `组合查找 · ${(data.combination.steps || []).length} 步`;
+      lastSearch = { query, results: null, isDirect: false };
+    } else if (data.answer_guide && (data.answer_guide.steps || []).length) {
       renderAnswerGuide(data.answer_guide, query);
       $("status").textContent = `指引答案 · ${data.answer_guide.steps.length} 步`;
+      // 路由占位「返回」时指引答案无法直接复渲染，回退为重搜
+      lastSearch = { query, results: null, isDirect: false };
     } else {
       renderSpellSuggestion(data.spell_suggestion, query);
       renderResults(data.results || [], false, query);
       $("status").textContent =
         `${modeLabel} · 返回 ${(data.results || []).length} 条结果`;
+      // 缓存本轮结果，供路由占位视图「返回搜索结果」直接复渲染（避免重搜）
+      lastSearch = { query, results: data.results || [], isDirect: false };
     }
   } catch (err) {
     $("results").innerHTML = `<div class="error">搜索失败：${err.message}</div>`;
@@ -344,6 +456,100 @@ async function showService(serviceId) {
   loadDropdown();
 }
 
+// ---------- 路由占位视图：route 不可达时用服务卡 + 相关 Top3 卡代替 ----------
+// 进入路径：搜索框自动补全点击 name/alias、搜索结果卡「进入」按钮、
+// AnswerGuide 步骤内服务引用、首页下拉最近/热门点击——统一走本函数。
+async function enterRoute(serviceId) {
+  hideAutocomplete();
+  clearSuggestion();
+  flushPendingDwell();
+  $("status").textContent = "加载路由界面…";
+  $("results").innerHTML = "";
+  renderSpellSuggestion(null, "");
+  try {
+    const [svc, related] = await Promise.all([
+      getJson(`${API}/service?service_id=${encodeURIComponent(serviceId)}`),
+      getJson(
+        `${API}/service/related?service_id=${encodeURIComponent(serviceId)}&k=3`
+      ),
+    ]);
+    renderRouteView(svc, related || []);
+    $("status").textContent = `路由界面（测试占位）：${svc.service_name}`;
+  } catch (err) {
+    $("results").innerHTML = `<div class="error">加载路由界面失败：${err.message}</div>`;
+    $("status").textContent = "加载失败";
+  }
+  loadDropdown();
+}
+
+// 渲染路由占位视图：服务卡（route 页面占位）+ 下方 3 张相关服务卡（点击递归进入）
+function renderRouteView(svc, related) {
+  const box = $("results");
+  box.innerHTML = "";
+  const view = document.createElement("article");
+  view.className = "route-view card";
+  view.innerHTML = `
+    <div class="card-head">
+      <span class="badge badge-direct">路由界面（测试占位）</span>
+      <h2 class="svc-name">${escapeHtml(svc.service_name)}</h2>
+      <button id="route-back" class="btn btn-back" type="button" title="返回上一轮搜索结果">← 返回搜索结果</button>
+    </div>
+    <div class="aliases">${(svc.aliases || []).map((a) => escapeHtml(a)).join(" · ")}</div>
+    <p class="intro">${escapeHtml(truncate(svc.service_intro, 300))}</p>
+    <div class="actions">
+      <span class="badge">组件：${escapeHtml(svc.component || "-")}</span>
+      <span class="badge">路由：${escapeHtml(svc.route || "-")}</span>
+      <span class="badge">决策按钮：${escapeHtml(svc.decision_button || "-")}</span>
+    </div>
+    <div class="route-note">当前测试环境下 route 页面不可访问，下方为与该服务相关性最高的 ${related.length} 个服务卡片（离线预计算 cosine top-3，进入即复用）：</div>
+    <section class="related-services"></section>
+  `;
+  // 返回按钮：优先复渲染上一轮搜索结果；指引答案/无结果则重搜；都没有则提示
+  view.querySelector("#route-back").addEventListener("click", () => {
+    if (lastSearch && lastSearch.results && lastSearch.results.length) {
+      renderResults(lastSearch.results, lastSearch.isDirect, lastSearch.query || "");
+      $("status").textContent = `已返回 · ${lastSearch.query || "搜索结果"}`;
+    } else if (lastSearch && lastSearch.query != null && lastSearch.query !== "") {
+      $("query").value = lastSearch.query;
+      doSearch(lastSearch.query);
+    } else {
+      box.innerHTML = '<div class="empty">暂无可返回的搜索结果</div>';
+      $("status").textContent = "就绪";
+    }
+  });
+  // 相关服务卡片：每张点击进入各自路由占位（递归），并记录点击
+  const relatedSec = view.querySelector(".related-services");
+  if (related.length) {
+    related.forEach((item) => {
+      const card = document.createElement("article");
+      card.className = "card related-card";
+      card.innerHTML = `
+        <div class="card-main">
+          <div class="card-head">
+            <span class="badge badge-sub">相关服务</span>
+            <h3 class="svc-name">${escapeHtml(item.service_name)}</h3>
+          </div>
+          <div class="aliases">${(item.aliases || []).map((a) => escapeHtml(a)).join(" · ")}</div>
+          <p class="intro">${escapeHtml(truncate(item.service_intro, 120))}</p>
+          <div class="actions">
+            <button class="btn btn-route" type="button">${escapeHtml(item.decision_button || "进入")} →</button>
+            <span class="badge">组件：${escapeHtml(item.component || "-")}</span>
+          </div>
+        </div>
+      `;
+      const btn = card.querySelector(".btn-route");
+      btn.addEventListener("click", () => {
+        recordClick(item.service_id);
+        enterRoute(item.service_id);
+      });
+      relatedSec.appendChild(card);
+    });
+  } else {
+    relatedSec.innerHTML = '<div class="empty">无相关服务（知识库服务数不足）</div>';
+  }
+  box.appendChild(view);
+}
+
 // M16 渲染步骤化指引答案：步骤文本 + 内嵌服务 chip（点击跳转 route）
 function renderAnswerGuide(guide, query) {
   const box = $("results");
@@ -440,6 +646,13 @@ function renderResults(results, isDirect, currentQuery) {
     return;
   }
   box.innerHTML = "";
+  renderResultCards(box, results, isDirect, currentQuery);
+  // 深度检索：勾选后异步填充每条结果右侧的「最佳组件」chip
+  doDeepComponents(results.slice(0, 10));
+}
+
+// 把结果卡片渲染进指定容器（不触发深度检索），供 renderResults 与组合查找步骤复用
+function renderResultCards(container, results, isDirect, currentQuery) {
   results.forEach((item, idx) => {
     const card = document.createElement("article");
     card.className = "card";
@@ -489,10 +702,76 @@ function renderResults(results, isDirect, currentQuery) {
       routeBtn.addEventListener("click", () => recordClick(item.service_id));
     }
     bindComponentActions(card, item);
-    box.appendChild(card);
+    container.appendChild(card);
   });
-  // 深度检索：勾选后异步填充每条结果右侧的「最佳组件」chip
-  doDeepComponents(results.slice(0, 10));
+}
+
+// 需求2：渲染泛化需求组合回复的卡片包组（每步 top1 按步骤顺序排列）
+function renderCombination(group, query) {
+  const box = $("results");
+  box.innerHTML = "";
+  const wrap = document.createElement("article");
+  wrap.className = "card combination-group";
+  const head = document.createElement("div");
+  head.className = "card-head";
+  head.innerHTML =
+    '<span class="badge badge-direct">组合查找</span>' +
+    `<h2 class="svc-name">${escapeHtml(group.title || query)}</h2>`;
+  wrap.appendChild(head);
+  const hint = document.createElement("p");
+  hint.className = "combination-hint";
+  hint.textContent =
+    "该需求被拆解为多个步骤，下列为各步骤最契合的 top1 服务，按顺序组合：";
+  wrap.appendChild(hint);
+  const stepsEl = document.createElement("ol");
+  stepsEl.className = "combination-steps";
+  (group.steps || []).forEach((step, idx) => {
+    const li = document.createElement("li");
+    li.className = "combination-step";
+    const label = document.createElement("div");
+    label.className = "step-label";
+    label.innerHTML =
+      `<span class="step-no">第 ${idx + 1} 步</span>` +
+      `<span class="step-name">${escapeHtml(step.step_label || step.step_query)}</span>`;
+    li.appendChild(label);
+    const body = document.createElement("div");
+    body.className = "step-body";
+    const items = step.results || [];
+    if (items.length) {
+      // 复用结果卡片渲染（不触发深度检索，避免每步都抓 10 页）
+      renderResultCards(body, items, false, step.step_query);
+    } else {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "该步骤未命中相关服务";
+      body.appendChild(empty);
+    }
+    li.appendChild(body);
+    stepsEl.appendChild(li);
+  });
+  wrap.appendChild(stepsEl);
+  box.appendChild(wrap);
+}
+
+// 需求3：渲染未命中提示（无关消息 / 无关 prompt / 提示词攻击）
+function renderNotFound(info, query) {
+  const box = $("results");
+  box.innerHTML = "";
+  const card = document.createElement("article");
+  card.className = "card not-found";
+  const catLabel = {
+    off_topic: "无关内容",
+    irrelevant_prompt: "无关指令",
+    prompt_attack: "提示词攻击",
+  }[info.category] || "未命中";
+  card.innerHTML =
+    '<div class="card-head">' +
+    '<span class="badge badge-direct">未命中</span>' +
+    `<h2 class="svc-name">${escapeHtml(catLabel)}</h2>` +
+    "</div>" +
+    `<p class="intro">${escapeHtml(info.message || "未找到相关服务。")}</p>` +
+    (info.hint ? `<p class="not-found-hint">${escapeHtml(info.hint)}</p>` : "");
+  box.appendChild(card);
 }
 
 // 深度组件检索：对 top-10 结果调 /api/search/deep-components，把最契合 query
@@ -832,14 +1111,20 @@ async function doMultiConditionSearch() {
 
 // 事件绑定
 $("search-btn").addEventListener("click", () => doSearch());
-$("query").addEventListener("input", scheduleSuggest);
+// input 同时驱动 ghost 补全与 10 行推荐服务下拉（二者各自防抖、互不阻塞）
+$("query").addEventListener("input", () => {
+  scheduleSuggest();
+  scheduleAutocomplete();
+});
 $("query").addEventListener("compositionstart", () => {
   composing = true;
   clearSuggestion();
+  hideAutocomplete();
 });
 $("query").addEventListener("compositionend", () => {
   composing = false;
   scheduleSuggest();
+  scheduleAutocomplete();
 });
 $("query").addEventListener("keydown", (e) => {
   if (e.key === "Tab") {
@@ -847,17 +1132,26 @@ $("query").addEventListener("keydown", (e) => {
     if (acceptSuggestion()) e.preventDefault();
     return;
   }
+  if (e.key === "Escape") {
+    hideAutocomplete();
+    return;
+  }
   if (e.key === "Enter") {
     clearSuggestion();
+    hideAutocomplete();
     doSearch();
   }
 });
 $("query").addEventListener("focus", () => {
   if (!$("query").value) loadDropdown();
+  else scheduleAutocomplete();   // 聚焦时若已有输入则立即补全
 });
 $("query").addEventListener("blur", () => {
-  // 延迟清，避免与潜在 click 冲突
-  setTimeout(() => clearSuggestion(), 150);
+  // 延迟清，避免与下拉项 click 冲突（click 在 blur 后触发）
+  setTimeout(() => {
+    clearSuggestion();
+    hideAutocomplete();
+  }, 150);
 });
 $("session-toggle").addEventListener("click", () => toggleSession());
 $("rollback-btn").addEventListener("click", () => rollbackSession());

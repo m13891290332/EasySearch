@@ -83,6 +83,18 @@ def sanitize_for_prompt(text: Any) -> str:
     return cleaned
 
 
+def is_prompt_injection(query: Any) -> bool:
+    """非抛出版注入检测：query 是否命中提示词注入关键词（供分类器降级判断）。
+
+    与 sanitize_query 的区别：sanitize_query 命中即抛 PromptInjectionError（→400）；
+    本函数仅返回布尔，供 query_classifier 在 DeepSeek 不可用时把攻击类 query 归入
+    irrelevant/prompt_attack（需求3：未命中提示而非 400），不阻断主链路。
+    """
+    if not isinstance(query, str):
+        query = str(query or "")
+    return _INJECTION_RE.search(query) is not None
+
+
 # ---------------------------------------------------------------- KB 字段
 def sanitize_text(text: Any, max_len: int = MAX_TEXT_LEN) -> str:
     """KB 字段清洗：剥控制/零宽字符，限长（默认 2000）。"""

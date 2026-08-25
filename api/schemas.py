@@ -102,6 +102,31 @@ class AnswerGuide(BaseModel):
     steps: list[AnswerStep]
 
 
+# ---------- 需求2/3：组合查找 + 未命中提示 ----------
+class CombinationStep(BaseModel):
+    """需求2：组合查找单步——步骤标签 + 该步 top1 结果。"""
+
+    step_label: str
+    step_query: str
+    results: list[SearchResultItem] = Field(default_factory=list)
+
+
+class CombinationGroup(BaseModel):
+    """需求2：泛化需求组合回复的卡片包组（按步骤顺序）。"""
+
+    title: str
+    steps: list[CombinationStep] = Field(default_factory=list)
+
+
+class NotFoundInfo(BaseModel):
+    """需求3：未命中提示——无关消息/无关 prompt/提示词攻击。"""
+
+    message: str
+    # off_topic=无关闲聊 / irrelevant_prompt=无关指令 / prompt_attack=越狱或数据抽取
+    category: str = "off_topic"
+    hint: str = ""
+
+
 class SearchResponse(BaseModel):
     user_id: str
     query: str
@@ -110,11 +135,21 @@ class SearchResponse(BaseModel):
     match_mode: str = "default"
     # 检索模式：keyword=仅关键词 / semantic=仅语义 / hybrid=混合（默认）
     retrieval_mode: str = "hybrid"
+    # 需求1：DeepSeek 语义意图预分类类别
+    # （normal_financial/colloquial/generalized_combination/irrelevant）；
+    # 默认 normal_financial 保旧消费者兼容（未传分类时按正常检索处理）
+    intent_category: str = "normal_financial"
+    # colloquial 时按金融术语理解后追加名词的检索用 query；其余为 None
+    augmented_query: str | None = None
     deep_searched: bool = False
     deep_reason: str = ""
     session_id: str | None = None
     turn_idx: int | None = None
     answer_guide: AnswerGuide | None = None
+    # 需求2：泛化需求组合回复（与 results 互斥；组合时 results 为空）
+    combination: CombinationGroup | None = None
+    # 需求3：未命中提示（与 results 互斥；未命中时 results 为空）
+    not_found: NotFoundInfo | None = None
     # M13：拼写建议（query 含 OOV/同音错字时给出「您是不是要找」候选；无可纠错为 None）
     spell_suggestion: str | None = None
     results: list[SearchResultItem] = Field(default_factory=list)
@@ -215,6 +250,39 @@ class SuggestResponse(BaseModel):
     """
     completion: str = ""
     source: str = "none"  # "llm" | "none"
+
+
+class AutocompleteTag(BaseModel):
+    """搜索框自动补全行的红色标签（不生成排序理由，改给 4 类标签）。"""
+
+    key: str  # "exact" | "semantic" | "click" | "intent"
+    label: str
+
+
+class AutocompleteItem(BaseModel):
+    """搜索框自动补全单行：匹配到的 name/alias + 4 类标签。
+
+    matched_text/matched_type 标识该行展示并标蓝的字段（name 或某个 alias）；
+    其余字段（route/component/decision_button）供点击直接进入路由占位视图复用。
+    """
+
+    service_id: str
+    service_name: str
+    aliases: list[str] = Field(default_factory=list)
+    matched_text: str
+    matched_type: str  # "name" | "alias"
+    route: str
+    component: str
+    decision_button: str
+    score: float
+    tags: list[AutocompleteTag] = Field(default_factory=list)
+
+
+class AutocompleteResponse(BaseModel):
+    """搜索框自动补全响应：query 输入即时返回 top-10 推荐服务（无排序理由，改给标签）。"""
+
+    query: str
+    items: list[AutocompleteItem] = Field(default_factory=list)
 
 
 class ServiceDetail(BaseModel):

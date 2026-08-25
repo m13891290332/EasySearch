@@ -29,8 +29,16 @@ from starlette.types import ASGIApp
 MAX_BODY_BYTES: int = int(os.getenv("EASYSEARCH_MAX_BODY_BYTES", str(10 * 1024 * 1024)))
 
 #: M12：限流白名单（健康检查/指标抓取通常来自可信内网，不参与限流）
+# 搜索框 autocomplete 每次输入即触发（200ms 防抖，连续输入 ~300 req/min），
+# 默认 60 req/min 会在 ~12s 后 429 打断下拉，故豁免（鉴权仍生效）。
 RATE_LIMIT_EXEMPT_PATHS: frozenset[str] = frozenset(
-    {"/api/health", "/metrics", "/api/metrics/realtime", "/api/metrics/stream"}
+    {
+        "/api/health",
+        "/metrics",
+        "/api/metrics/realtime",
+        "/api/metrics/stream",
+        "/api/search/autocomplete",
+    }
 )
 
 #: API Key 鉴权白名单（监控探针不应被鉴权拦截）

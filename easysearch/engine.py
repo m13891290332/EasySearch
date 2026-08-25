@@ -49,6 +49,7 @@ from .intent import (
     IntentResult,
     IntentRouter,
 )
+from .query_classifier import QueryClassification, QueryClassifier
 from .metrics import get_metrics
 from .mmr import MMRReranker
 from .models import ServiceRecord, route_info
@@ -120,6 +121,9 @@ class ServiceSearchEngine:
         # 深度组件检索：top-10 结果抓取服务 route 页面 → LLM 分析「最契合 query 的组件」
         # 无 key / LLM 失败 → ComponentAnalyzer 内部降级启发式（pick_heuristic）
         self.component_analyzer = ComponentAnalyzer(self.deepseek_client)
+        # 需求1：DeepSeek 语义意图预分类器（query 进入检索前的第一道分类）。
+        # 无 key / 失败 → 内部规则降级，不阻塞主链路；结果按 query LRU 缓存。
+        self.query_classifier = QueryClassifier(self.deepseek_client)
 
         # A 组 / B 组新组件
         self.vector_index = VectorIndex()
@@ -146,6 +150,18 @@ class ServiceSearchEngine:
         # M9：当前 KB 内容 hash + 最近一次 embedding 错误（embedding-status 端点用）
         self.kb_hash: str = ""
         self._kb_last_error: str = ""
+        # 搜索框自动补全：相关服务 top-3 离线预计算目录（与 embeddings/kb_versions 同级；
+        # :memory: 测试库不持久化，但仍计算内存 dict 供测试）。文件 related_{kb_hash}.json。
+        self._related_dir: str | None = (
+            None if self._embeddings_dir is None
+            else os.path.join(os.path.dirname(self._embeddings_dir), "related")
+        )
+        # service_id -> [相关 service_id, ...]（top-3，cosine，排除自身）；KB 加载时预计算
+        self._related_services: dict[str, list[str]] = {}
+        # 搜索框自动补全极小 LRU（TTL 5s, 256），合并连续按键避免重复 embed/bm25 计算
+        self._autocomplete_cache: "OrderedDict[tuple[str, str], tuple[list[dict[str, Any]], float]]" = OrderedDict()
+        self._autocomplete_cache_size = 256
+        self._autocomplete_cache_ttl = 5.0
         # M4：结果 LRU 缓存（size=512, TTL=60s），key=(user_id, query)；点击后失效
         self._result_cache: "OrderedDict[tuple[str, str], tuple[list[dict[str, Any]], float]]" = OrderedDict()
         self._result_cache_size = 512
@@ -349,6 +365,7 @@ class ServiceSearchEngine:
             self._mf_bm25.build({})
             self.synonym_expander = SynonymExpander()  # 重置为基础词典
             self.spell_corrector = None
+            self._related_services.clear()  # 空库无相关服务，防旧数据残留
             return
 
         records: list[ServiceRecord] = []
@@ -428,6 +445,8 @@ class ServiceSearchEngine:
                 self.vector_index.save_npz(npz_path)
         # 兼容缓存：从 VectorIndex 反查
         self._service_embeddings_cache = {sid: self.vector_index.get(sid) for sid in self.services}
+        # 搜索框路由占位：KB 加载后预计算每个服务 top-3 相关服务（cosine，排除自身）
+        self._build_related_services()
 
     @staticmethod
     def _project_to_single_text(
@@ -727,6 +746,69 @@ class ServiceSearchEngine:
         return self.intent_router.classify(
             query, services=self.services, has_session=has_session
         )
+
+    # ---------- 需求1：DeepSeek 语义意图预分类 ----------
+    def _services_meta(self) -> list[dict[str, Any]]:
+        """供分类器判断相关性的紧凑服务清单（name + aliases，cap 60）。
+
+        只传名称/别名（不含 route/intro），既足够 LLM 判断「是否金融服务查找」，
+        又控制 prompt 体积。条目数 cap 60 避免大 KB 时 prompt 过长。
+        """
+        meta: list[dict[str, Any]] = []
+        for svc in self.services.values():
+            meta.append(
+                {"name": svc.service_name, "aliases": list(svc.aliases)[:5]}
+            )
+            if len(meta) >= 60:
+                break
+        return meta
+
+    async def classify_query_async(self, query: str) -> QueryClassification:
+        """需求1：query 进入检索前的 DeepSeek 语义意图预分类。
+
+        返回 QueryClassification（normal_financial/colloquial/
+        generalized_combination/irrelevant）。DeepSeek 不可用时规则降级，
+        不阻塞主链路；结果按 query LRU 缓存（512/120s）避免重复调用。
+        本方法仅做粗分类，不影响既有 M5 规则路由（normal/colloquial 仍会
+        进入 classify_intent 做细粒度 navigational/multi/guide/session 路由）。
+        """
+        return await self.query_classifier.classify_async(
+            query, services_meta=self._services_meta()
+        )
+
+    def classify_query(self, query: str) -> QueryClassification:
+        """同步版预分类（测试/兼容入口）。"""
+        return self.query_classifier.classify(
+            query, services_meta=self._services_meta()
+        )
+
+    # ---------- 需求2：泛化需求组合回复 ----------
+    async def search_combination_async(
+        self, user_id: str, steps: list[str]
+    ) -> list[dict[str, Any]]:
+        """对每个步骤 query 并发检索，取各自 top1，按步骤顺序组装卡片包组。
+
+        每步复用 ``search_async``（含召回/rerank/MMR/理由，离线自动降级）；
+        单步异常 → 该步置空结果（不阻断整组）。返回 list[dict]，每项形态：
+            {step_label, step_query, results}
+        其中 results 为该步 top1（可能为空列表）。query 命中注入由 search_async
+        内部 sanitize_query 处理（单步 try/except 兜底，不抛 400 到组合层）。
+        """
+        clean = [s.strip() for s in (steps or []) if s and s.strip()]
+        if not clean:
+            return []
+
+        async def _one(step: str) -> dict[str, Any]:
+            try:
+                res = await self.search_async(user_id, step)
+            except Exception as exc:  # noqa: BLE001 - 单步失败不阻断整组
+                logger.warning(
+                    "combination step %r failed: %s", step, exc
+                )
+                res = []
+            return {"step_label": step, "step_query": step, "results": res[:1]}
+
+        return await asyncio.gather(*[_one(s) for s in clean])
 
     def _pin_navigational_to_top(
         self, results: list[dict[str, Any]], service_id: str | None
@@ -1857,6 +1939,94 @@ class ServiceSearchEngine:
             "components": list(service.components),
         }
 
+    # ---------- 相关服务离线预计算（搜索框路由占位视图用）----------
+    def _build_related_services(self) -> None:
+        """预计算每个服务的 top-3 相关服务（embedding cosine，排除自身）并持久化。
+
+        - 优先从 ``related_{kb_hash}.json`` 加载（重启命中即零计算）
+        - 否则对每个 sid 用 ``vector_index.score_all(vec)`` 求与其余所有服务的 cosine，
+          降序取 top-3（自身相似度恒为 1.0，必须排除），存入 ``_related_services``
+        - 落盘 JSON 到 ``_related_dir``（:memory: 测试库不落盘，仅内存）
+        - 持久化/加载失败静默：不影响主链路，最坏情况 ``get_related_services`` 即时算
+        """
+        self._related_services.clear()
+        if not self.services:
+            return
+        path: str | None = None
+        if self._related_dir and self.kb_hash:
+            path = os.path.join(self._related_dir, f"related_{self.kb_hash}.json")
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as fp:
+                        loaded = json.load(fp)
+                    if isinstance(loaded, dict):
+                        self._related_services = {
+                            str(k): [str(x) for x in v]
+                            for k, v in loaded.items()
+                            if isinstance(v, list)
+                        }
+                        return
+                except (OSError, json.JSONDecodeError):
+                    pass  # 损坏则重算
+        # 在线计算：服务数不多（KB 规模 ~50），N×N cosine 在毫秒级
+        for sid in self.services:
+            vec = self.vector_index.get(sid)
+            if not vec:
+                continue
+            sims = self.vector_index.score_all(vec)
+            ranked = sorted(
+                ((other, s) for other, s in sims.items() if other != sid),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )[:3]
+            self._related_services[sid] = [other for other, _ in ranked]
+        # 落盘（与 vector_index.save_npz 一致的 exist_ok 容错）
+        if path is not None and self._related_services:
+            try:
+                os.makedirs(self._related_dir or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fp:
+                    json.dump(self._related_services, fp, ensure_ascii=False)
+            except OSError:
+                pass  # 持久化失败不影响功能
+
+    def get_related_services(
+        self, service_id: str, k: int = 3
+    ) -> list[dict[str, Any]]:
+        """返回 service 的 top-k 相关服务详情（预计算，过滤自身/已下线）。
+
+        - 查 ``_related_services``；命中则按其顺序取详情
+        - 防御性过滤 ``rid == service_id`` 或 rid 不在 KB（KB 缩容后旧预计算 ID 可能失效）
+        - 未预计算（如 KB 未加载即调用）→ 即时用 cosine 算 top-k
+        - 返回 ``get_service(rid)`` 列表（与 /api/service 同构，供前端路由占位卡复用）
+        """
+        if service_id not in self.services:
+            return []
+        ids = self._related_services.get(service_id)
+        if not ids:
+            # 即时算兜底（极端情况：_build_related_services 未跑或被清空）
+            vec = self.vector_index.get(service_id)
+            if not vec:
+                return []
+            sims = self.vector_index.score_all(vec)
+            ids = [
+                other
+                for other, _ in sorted(
+                    ((o, s) for o, s in sims.items() if o != service_id),
+                    key=lambda kv: kv[1],
+                    reverse=True,
+                )[:k]
+            ]
+        result: list[dict[str, Any]] = []
+        for rid in ids:
+            if rid == service_id or rid not in self.services:
+                continue
+            detail = self.get_service(rid)
+            if detail:
+                result.append(detail)
+            if len(result) >= k:
+                break
+        return result
+
     # ---------- M13 拼写建议 ----------
     def spell_suggest(self, query: str) -> str | None:
         """对 query 生成「您是不是要找」建议字符串；无 OOV/无可纠错返回 None。
@@ -1923,6 +2093,142 @@ class ServiceSearchEngine:
                 exc_info=True,
             )
             return None
+
+    # ---------- 搜索框自动补全（边输入边推荐，不生成排序理由，改给 4 标签）----------
+    def autocomplete(
+        self, user_id: str, query: str, top_n: int = 10
+    ) -> list[dict[str, Any]]:
+        """混合召回 top-20 → 本地 rerank top-10 → 4 红色标签 + matched_text。
+
+        与 ``search`` 的关键差异：
+          - 不调 ``store.append_query``（autocomplete ≠ 真实搜索，不污染 recent_queries）
+          - 不触 ``result_cache``（按键级新鲜度优先；自有极小 LRU TTL 5s 合并连续按键）
+          - 意图匹配标签用 ``reranker.local_rerank``（无 LLM，毫秒级），不跑远程 rerank
+          - 不生成排序理由，改为右侧 4 种红色标签
+        返回 list[dict]，字段仅含前端所需（AutocompleteItem 同构，不含中间 rerank_score 等）。
+        """
+        q = sanitize_query(query)
+        if not q or not self.services:
+            return []
+        # 极小 LRU：连续按键合并（5s TTL），避免重复 embed/bm25 计算
+        cache_key = (user_id, q)
+        now = time.time()
+        cached = self._autocomplete_cache.get(cache_key)
+        if cached and cached[1] > now:
+            self._autocomplete_cache.move_to_end(cache_key)
+            return cached[0]
+        timestamp = now
+        # embed（与 _build_top_candidates 一致：同义词归一再 embed）
+        embed_query = (
+            self.synonym_expander.normalize(q) if SYNONYM_ENABLED else q
+        )
+        q_emb = self.embedding_model.embed(embed_query)
+        if not q_emb:
+            return []
+        # tokens（与 _build_top_candidates 一致的同义词/拼写扩展链）
+        query_tokens = tokenize(q)
+        if SYNONYM_ENABLED:
+            query_tokens = self.synonym_expander.expand(query_tokens)
+        if SPELL_ENABLED and self.spell_corrector is not None:
+            query_tokens = self.spell_corrector.correct_tokens(query_tokens)
+        # 三路打分
+        vec = self.vector_index.score_all(q_emb)
+        bm25_raw = self._mf_bm25.batch_score_tokens(query_tokens)
+        pop_raw = self.store.popularity_decayed(
+            tau=POPULARITY_TAU, now=timestamp, window_days=POPULARITY_WINDOW_DAYS
+        )
+        pop_raw = self._apply_negative_penalty(pop_raw, timestamp)
+        bm25_norm = normalize_scores(bm25_raw, mode=NORMALIZE_MODE)
+        pop_norm = normalize_scores(pop_raw, mode=NORMALIZE_MODE)
+        # 全表 hybrid 打分构造候选（小库全量；与 _build_top_candidates dict 形态一致）
+        candidates: list[dict[str, Any]] = []
+        for sid, svc in self.services.items():
+            info = route_info(svc.route)
+            score = self._hybrid_score(
+                vector_similarity=vec.get(sid, 0.0),
+                bm25_score=bm25_norm.get(sid, 0.0),
+                popularity_score=pop_norm.get(sid, 0.0),
+            )
+            candidates.append(
+                {
+                    "service_id": svc.service_id,
+                    "service_name": svc.service_name,
+                    "aliases": list(svc.aliases),
+                    "service_intro": svc.service_intro,
+                    "route": info["route"],
+                    "component": info["component"],
+                    "decision_button": info["decision_button"],
+                    "derived": info["derived"],
+                    "components": list(svc.components),
+                    "score": score,
+                }
+            )
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        top20 = candidates[:20]
+        if not top20:
+            return []
+        reranked = self.reranker.local_rerank(q, top20)
+        top10 = reranked[:top_n]
+        # 用户点击统计 → 「过去常点」标签
+        clicks = self.store.user_click_counts(user_id)
+        total_clicks = sum(clicks.values())
+        top3_clicked = {
+            sid
+            for sid, _ in sorted(
+                clicks.items(), key=lambda kv: kv[1], reverse=True
+            )[:3]
+        }
+        q_lower = q.strip().lower()
+        result: list[dict[str, Any]] = []
+        for idx, item in enumerate(top10):
+            sid = item["service_id"]
+            name = item["service_name"]
+            aliases = item["aliases"]
+            name_lower = name.lower()
+            aliases_lower = [str(a).lower() for a in aliases]
+            # matched_text：q 是 name 子串→name；否则 alias 子串→该 alias；否则 name 回退
+            matched_text, matched_type = name, "name"
+            if q_lower:
+                if q_lower in name_lower:
+                    matched_text, matched_type = name, "name"
+                else:
+                    for a, a_lower in zip(aliases, aliases_lower):
+                        if q_lower in a_lower:
+                            matched_text, matched_type = a, "alias"
+                            break
+            # 4 种红色标签（按固定展示顺序追加命中的）
+            tags: list[dict[str, str]] = []
+            if q_lower and (q_lower == name_lower or q_lower in aliases_lower):
+                tags.append({"key": "exact", "label": "关键词完全匹配"})
+            if vec.get(sid, 0.0) > 0.5:
+                tags.append({"key": "semantic", "label": "语义相似"})
+            if total_clicks > 0 and clicks.get(sid, 0) > 0 and sid in top3_clicked:
+                tags.append({"key": "click", "label": "过去常点"})
+            if idx < 3:
+                tags.append({"key": "intent", "label": "意图匹配"})
+            result.append(
+                {
+                    "service_id": sid,
+                    "service_name": name,
+                    "aliases": aliases,
+                    "matched_text": matched_text,
+                    "matched_type": matched_type,
+                    "route": item["route"],
+                    "component": item["component"],
+                    "decision_button": item["decision_button"],
+                    "score": item["score"],
+                    "tags": tags,
+                }
+            )
+        # 写极小 LRU（TTL 5s）
+        self._autocomplete_cache[cache_key] = (
+            result,
+            now + self._autocomplete_cache_ttl,
+        )
+        self._autocomplete_cache.move_to_end(cache_key)
+        while len(self._autocomplete_cache) > self._autocomplete_cache_size:
+            self._autocomplete_cache.popitem(last=False)
+        return result
 
     # ---------- M8 页面内组件执行（本期打桩）----------
     def execute_component_action(

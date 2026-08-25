@@ -351,6 +351,15 @@ class Qwen3VLReranker:
         reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
         return reranked
 
+    def local_rerank(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """公开轻量重排入口（无 LLM），供搜索框 autocomplete 等按键级场景复用。
+
+        委托 ``_local_rerank``（纯 Python token-overlap，``rerank_score = score + 0.01*overlap``），
+        不调远程 rerank、不调 LLM，响应在毫秒级；对入参 candidates 做浅拷贝不 mutate 原列表。
+        内部 ``_remote_rerank`` 仍调 ``_local_rerank`` 作降级，不受本公开别名影响。
+        """
+        return self._local_rerank(query, candidates)
+
     @staticmethod
     def _candidate_text(item: dict[str, Any]) -> str:
         return (

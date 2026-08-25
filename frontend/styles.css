@@ -242,6 +242,10 @@ body {
   flex: 1;
   min-width: 220px;
   border-radius: 14px;            /* 与 input 圆角一致，spotlight 描边环贴合 */
+  z-index: 60;                    /* 提升整个 query-wrap 栈叠上下文（spotlight 的
+                                     isolation:isolate 会把 .autocomplete 的 z-index
+                                     困在内部），高于 #dropdown(#最近搜索)/高级面板/
+                                     会话面板等兄弟，autocomplete 下拉才能置顶 */
 }
 .query-wrap input {
   width: 100%;
@@ -281,6 +285,152 @@ body {
   line-height: 50px;
   user-select: none;
 }
+
+/* ---------- 搜索框自动补全：10 行推荐服务 + 4 红色标签 ---------- */
+/* 下拉锚定到 query-wrap（绝对定位），与 input 同源玻璃质感 */
+.autocomplete {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  background: var(--card-solid);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-solid);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  padding: 6px 0 0;
+}
+[data-theme="dark"] .autocomplete { background: rgba(15, 23, 42, 0.92); }
+.autocomplete[hidden] { display: none; }
+.ac-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 56vh;
+  overflow-y: auto;
+}
+.ac-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border-solid);
+}
+.ac-row:last-child { border-bottom: none; }
+.ac-row:hover { background: rgba(43, 108, 255, 0.06); }
+.ac-match-btn {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 15px;
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+}
+.ac-type-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  background: rgba(148, 163, 184, 0.18);
+  border-radius: 5px;
+  padding: 2px 6px;
+}
+.ac-match-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 匹配文本标蓝（命中 query 的部分用 mark 高亮，下面 .ac-match-btn mark 覆盖为蓝色） */
+.ac-match-btn mark {
+  background: rgba(59, 130, 246, 0.18);
+  color: var(--primary);
+  padding: 0 2px;
+  border-radius: 3px;
+  font-weight: 600;
+}
+[data-theme="dark"] .ac-match-btn mark { background: rgba(109, 155, 255, 0.22); color: var(--primary); }
+.ac-match-btn:hover .ac-type-badge { color: var(--primary); border-color: var(--primary); }
+
+/* 4 红色标签（固定顺序：完全匹配 / 语义相似 / 过去常点 / 意图匹配） */
+.ac-tags {
+  display: inline-flex;
+  gap: 5px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.ac-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 6px;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+[data-theme="dark"] .ac-tag {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(248, 113, 113, 0.4);
+}
+.ac-hint {
+  margin: 0;
+  padding: 8px 14px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  border-top: 1px dashed var(--border-solid);
+  background: rgba(148, 163, 184, 0.06);
+}
+
+/* ---------- 路由占位视图 + 相关服务卡片 ---------- */
+.route-view { flex-direction: column; gap: 10px; }
+.route-view .card-head { align-items: center; }
+.route-view .svc-name { flex: 1; }
+.btn-back {
+  height: auto;
+  padding: 6px 14px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid var(--border-solid);
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+[data-theme="dark"] .btn-back { background: rgba(15, 23, 42, 0.5); }
+.btn-back:hover { border-color: var(--primary); color: var(--primary); }
+.route-note {
+  margin: 6px 0 4px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  background: rgba(251, 191, 36, 0.12);
+  border-left: 3px solid #f59e0b;
+  border-radius: 4px;
+  line-height: 1.6;
+}
+.related-services {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.related-card { flex-direction: column; }
+.related-card .card-main { width: 100%; }
+.related-card .svc-name { font-size: 16px; }
 
 /* 按钮：玻璃 + spotlight 边环 */
 .search-box button,
@@ -1064,4 +1214,74 @@ mark {
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* ---------- 需求2/3：组合查找卡片包组 + 未命中提示 ---------- */
+.combination-group .combination-hint {
+  margin: 6px 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.combination-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.combination-step {
+  display: flex;
+  gap: 14px;
+  align-items: stretch;
+  padding: 10px;
+  border-radius: 14px;
+  background: rgba(43, 108, 255, 0.05);
+  border: 1px dashed var(--border-solid);
+}
+.combination-step .step-label {
+  flex: 0 0 96px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  text-align: center;
+}
+.combination-step .step-no {
+  font-size: 12px;
+  color: var(--muted);
+}
+.combination-step .step-name {
+  font-weight: 600;
+  color: var(--primary-dark);
+}
+.combination-step .step-body {
+  flex: 1;
+  min-width: 0;
+}
+.combination-step .step-body .card { margin: 0; }
+.combination-step .step-body .empty {
+  padding: 14px;
+  color: var(--muted);
+  font-size: 14px;
+}
+[data-theme="dark"] .combination-step {
+  background: rgba(96, 165, 250, 0.08);
+  border-color: rgba(148, 163, 184, 0.25);
+}
+[data-theme="dark"] .combination-step .step-name { color: #93c5fd; }
+
+/* 未命中提示卡片 */
+.not-found .not-found-hint {
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(43, 108, 255, 0.08);
+  color: var(--primary-dark);
+  font-size: 14px;
+}
+[data-theme="dark"] .not-found .not-found-hint {
+  background: rgba(96, 165, 250, 0.12);
+  color: #93c5fd;
 }

@@ -251,6 +251,22 @@ class SQLiteStore:
                 break
         return result
 
+    def user_click_counts(self, user_id: str, limit: int = 1000) -> dict[str, int]:
+        """返回 {service_id: count}（deprecated=0 的点击，按次数降序，limit 条）。
+
+        供搜索框「过去常点」标签使用：统计该用户对每个服务的非下线点击次数，
+        取次数最高的若干服务视为「过去常点」。SQL 过滤 deprecated=0 与 M12 语义一致
+        （已下线服务的点击不计入行为偏好）。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT service_id, COUNT(*) AS c FROM user_clicks "
+                "WHERE user_id=? AND deprecated=0 "
+                "GROUP BY service_id ORDER BY c DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return {row["service_id"]: int(row["c"]) for row in rows}
+
     # ---------- 全局热门 ----------
     def hot_services(self, limit: int = 3) -> list[str]:
         with self._lock:

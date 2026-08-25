@@ -59,6 +59,11 @@
           autocomplete="off"
           placeholder="搜索服务，如：开户、银证转账、新股新债…"
         />
+        <!-- 搜索框自动补全：边输入边出现 10 行推荐服务（标蓝匹配名/别名 + 4 红色标签） -->
+        <div id="autocomplete" class="autocomplete" hidden>
+          <ul id="autocomplete-list" class="ac-list"></ul>
+          <p class="ac-hint">点击服务名/别名直接进入路由界面 · 点搜索按钮走完整检索</p>
+        </div>
       </div>
       <button id="search-btn" class="spotlight" type="button">搜索</button>
       <select id="retrieval-mode" class="retrieval-mode-select" title="检索模式：keyword=仅关键词 / semantic=仅语义 / hybrid=混合">
